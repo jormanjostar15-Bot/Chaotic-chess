@@ -31,6 +31,9 @@ const PIECE_ICONS: Record<PieceType, Record<Color, string>> = {
   [PieceType.KING]: { [Color.WHITE]: '♔', [Color.BLACK]: '♚' },
 };
 
+// Функция для генерации короткого случайного ID для стабильности
+const generateShortId = () => Math.random().toString(36).substring(2, 8).toUpperCase();
+
 export default function App() {
   const [state, setState] = useState<BoardState>(createInitialState());
   const [selected, setSelected] = useState<Position | null>(null);
@@ -45,27 +48,31 @@ export default function App() {
   const [connection, setConnection] = useState<any>(null);
   const [myColor, setMyColor] = useState<Color | null>(null);
   const [peerError, setPeerError] = useState<string | null>(null);
+  const [isRetrying, setIsRetrying] = useState(false);
   const peerRef = useRef<any>(null);
 
   const initPeer = () => {
     if (peerRef.current) {
-        peerRef.current.destroy();
+      peerRef.current.destroy();
     }
     
     setPeerError(null);
     setMyPeerId('');
+    setIsRetrying(false);
 
     try {
-      // Конфигурация специально для GitHub Pages и Netlify (HTTPS)
-      const peer = new Peer(undefined, {
+      // Расширенная конфигурация для обхода ограничений GitHub Pages и нестабильных серверов
+      const peer = new Peer(generateShortId(), {
         host: '0.peerjs.com',
         port: 443,
         secure: true,
-        debug: 1, // Минимум логов для скорости
+        debug: 1,
+        pingInterval: 3000, // Частое пингование для поддержания NAT-туннеля
         config: {
           'iceServers': [
             { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:stun1.l.google.com:19302' }
+            { urls: 'stun:stun1.l.google.com:19302' },
+            { urls: 'stun:stun2.l.google.com:19302' }
           ]
         }
       });
@@ -74,6 +81,7 @@ export default function App() {
 
       peer.on('open', (id: string) => {
         setMyPeerId(id);
+        setIsRetrying(false);
       });
 
       peer.on('connection', (conn: any) => {
@@ -84,22 +92,27 @@ export default function App() {
       });
 
       peer.on('error', (err: any) => {
-        console.error('Peer error type:', err.type);
-        if (err.type === 'network' || err.type === 'server-error') {
-          setPeerError('Ошибка сети. Попробуйте обновить 🔄');
+        console.error('PeerJS Error:', err.type, err);
+        
+        // Автоматическая попытка переподключения при некоторых ошибках
+        if (err.type === 'server-error' || err.type === 'network') {
+          setPeerError('Ошибка сервера. Переподключение...');
+          setIsRetrying(true);
+          setTimeout(() => initPeer(), 3000);
         } else if (err.type === 'peer-unavailable') {
-          setPeerError('ID друга не найден. Проверьте адрес.');
+          setPeerError('Друг не найден. Проверьте код.');
         } else {
-          setPeerError(`Сбой: ${err.type}`);
+          setPeerError(`Сбой (${err.type}). Нажмите 🔄`);
         }
       });
 
       peer.on('disconnected', () => {
+        console.warn('Disconnected. Reconnecting...');
         peer.reconnect();
       });
 
     } catch (e) {
-      setPeerError('Ошибка запуска P2P');
+      setPeerError('Критический сбой P2P');
     }
   };
 
@@ -122,26 +135,33 @@ export default function App() {
     });
 
     conn.on('close', () => {
-        setLog(prev => ["Связь с противником потеряна.", ...prev]);
-        setConnection(null);
+      setLog(prev => ["Связь разорвана.", ...prev]);
+      setConnection(null);
+    });
+
+    conn.on('error', (err: any) => {
+      console.error('Connection Error:', err);
+      setLog(prev => ["Ошибка передачи данных.", ...prev]);
     });
   };
 
   const connectToPeer = () => {
     if (!remotePeerId || !peerRef.current) return;
-    const conn = peerRef.current.connect(remotePeerId.trim(), {
-        reliable: true
+    const cleanId = remotePeerId.trim().toUpperCase();
+    const conn = peerRef.current.connect(cleanId, {
+      reliable: true,
+      serialization: 'json'
     });
     setConnection(conn);
     setMyColor(Color.BLACK);
-    setLog(prev => ["Подключаемся к другу... Пожалуйста, подождите.", ...prev]);
+    setLog(prev => ["Подключаемся...", ...prev]);
     setupConnection(conn);
   };
 
   const copyId = () => {
     if (!myPeerId) return;
     navigator.clipboard.writeText(myPeerId);
-    setLog(prev => ["Ваш ID скопирован!", ...prev]);
+    setLog(prev => ["Код скопирован!", ...prev]);
   };
 
   // Экономика
@@ -296,17 +316,17 @@ export default function App() {
           <p className="text-zinc-500 mb-8 text-[10px] uppercase font-bold tracking-[0.2em]">P2P Battle on GitHub Pages</p>
           
           <div className="space-y-6">
-            <div className={`bg-zinc-800 p-5 rounded-xl border transition-all ${peerError ? 'border-red-900/50' : 'border-zinc-700'}`}>
+            <div className={`bg-zinc-800 p-5 rounded-xl border transition-all ${peerError ? 'border-red-900/50 bg-red-950/20' : 'border-zinc-700'}`}>
               <p className="text-[10px] font-bold text-zinc-500 uppercase mb-3">Ваш секретный код:</p>
               <div className="flex items-center gap-3">
-                <p className={`flex-grow font-mono text-sm text-left break-all ${peerError ? 'text-red-400' : 'text-yellow-500'}`}>
-                  {peerError ? peerError : (myPeerId || 'Создание комнаты...')}
+                <p className={`flex-grow font-mono text-sm text-left break-all ${peerError ? 'text-red-400 animate-pulse' : 'text-yellow-500 font-bold'}`}>
+                  {peerError ? peerError : (myPeerId || 'Загрузка сервера...')}
                 </p>
                 {myPeerId && !peerError && (
                   <button onClick={copyId} className="bg-zinc-700 hover:bg-zinc-600 p-2 rounded-lg text-xs transition-colors">📋</button>
                 )}
-                {peerError && (
-                  <button onClick={initPeer} className="bg-red-600 hover:bg-red-500 p-2 rounded-lg text-xs text-white">🔄</button>
+                {(peerError || isRetrying) && (
+                  <button onClick={initPeer} className="bg-red-600 hover:bg-red-500 p-2 rounded-lg text-xs text-white transition-all active:rotate-180">🔄</button>
                 )}
               </div>
             </div>
@@ -316,9 +336,9 @@ export default function App() {
               <input 
                 type="text" 
                 value={remotePeerId} 
-                onChange={(e) => setRemotePeerId(e.target.value)}
-                className="bg-zinc-800 border border-zinc-700 p-4 rounded-xl text-white font-mono text-sm focus:ring-2 ring-blue-500 outline-none w-full"
-                placeholder="Код от друга..."
+                onChange={(e) => setRemotePeerId(e.target.value.toUpperCase())}
+                className="bg-zinc-800 border border-zinc-700 p-4 rounded-xl text-white font-mono text-sm focus:ring-2 ring-blue-500 outline-none w-full uppercase"
+                placeholder="ABCDEF"
               />
               <button 
                 onClick={connectToPeer}
@@ -331,7 +351,7 @@ export default function App() {
             
             <div className="p-4 bg-zinc-800/30 rounded-xl text-left border border-zinc-800/50">
               <p className="text-[10px] text-zinc-500 leading-relaxed">
-                <strong className="text-zinc-400">Совет:</strong> Если игра не находит друга, убедитесь, что вы оба используете <code className="text-blue-400">https://</code> в начале адреса страницы.
+                <strong className="text-zinc-400">Внимание:</strong> Соединение устанавливается напрямую между браузерами. Если сервер PeerJS перегружен, попробуйте нажать 🔄.
               </p>
             </div>
           </div>
