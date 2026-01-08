@@ -41,7 +41,6 @@ export default function App() {
   const [gameOver, setGameOver] = useState<string | null>(null);
   const [shopActive, setShopActive] = useState<PieceType | null>(null);
 
-  // Сетевые состояния
   const [isPeerLibReady, setIsPeerLibReady] = useState(false);
   const [myPeerId, setMyPeerId] = useState<string>('');
   const [remotePeerId, setRemotePeerId] = useState<string>('');
@@ -51,6 +50,7 @@ export default function App() {
   const [isConnected, setIsConnected] = useState(false);
   
   const peerRef = useRef<any>(null);
+  const retryTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     const checkPeer = setInterval(() => {
@@ -64,63 +64,104 @@ export default function App() {
 
   const initPeer = () => {
     if (typeof Peer === 'undefined') return;
-    if (peerRef.current) peerRef.current.destroy();
+    if (peerRef.current) {
+      peerRef.current.destroy();
+    }
     
     setPeerError(null);
-    setMyPeerId('');
 
     const peer = new Peer(generateShortId(), {
       host: '0.peerjs.com',
       port: 443,
       secure: true,
       debug: 1,
-      pingInterval: 3000,
+      config: {
+        'iceServers': [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' }
+        ]
+      }
     });
     
     peerRef.current = peer;
 
-    peer.on('open', (id: string) => setMyPeerId(id));
+    peer.on('open', (id: string) => {
+      setMyPeerId(id);
+      setPeerError(null);
+      if (retryTimerRef.current) {
+        window.clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
+      }
+    });
 
     peer.on('connection', (conn: any) => {
-      if (connection) connection.close();
+      // If we are already in game, don't allow new connections unless closed
+      if (connection && connection.open) {
+        conn.close();
+        return;
+      }
       setConnection(conn);
       setMyColor(Color.WHITE);
       setupConnection(conn);
     });
 
     peer.on('error', (err: any) => {
-      console.error('PeerJS Error:', err.type);
-      if (err.type === 'network' || err.type === 'server-error') {
-        setPeerError('Ошибка сети. Переподключение...');
-        setTimeout(() => initPeer(), 5000);
-      } else if (err.type === 'disconnected') {
-        peer.reconnect();
+      console.error('PeerJS Error:', err.type, err);
+      const errorMsg = `Ошибка: ${err.type}`;
+      
+      if (err.type === 'network' || err.type === 'server-error' || err.type === 'disconnected') {
+        setPeerError('Проблема с сетью. Переподключение...');
+        if (!retryTimerRef.current) {
+          retryTimerRef.current = window.setTimeout(() => {
+            retryTimerRef.current = null;
+            initPeer();
+          }, 3000);
+        }
       } else {
-        setPeerError(`Ошибка: ${err.type}`);
+        setPeerError(errorMsg);
       }
     });
 
     peer.on('disconnected', () => {
-      setLog(prev => ["Отключено от сервера. Пробуем вернуть связь...", ...prev]);
+      setPeerError('Потеряна связь с сервером. Восстановление...');
       peer.reconnect();
     });
   };
 
   useEffect(() => {
     if (isPeerLibReady) initPeer();
-    return () => peerRef.current?.destroy();
+    return () => {
+      peerRef.current?.destroy();
+      if (retryTimerRef.current) window.clearTimeout(retryTimerRef.current);
+    };
   }, [isPeerLibReady]);
 
   const setupConnection = (conn: any) => {
     conn.on('open', () => {
       setIsConnected(true);
-      setLog(prev => ["Связь установлена!", ...prev]);
+      setPeerError(null);
+      setLog(prev => ["Связь с игроком установлена!", ...prev]);
+      
+      // Heartbeat to keep connection alive
+      const heartbeat = setInterval(() => {
+        if (conn.open) {
+          conn.send({ type: 'HEARTBEAT' });
+        } else {
+          clearInterval(heartbeat);
+        }
+      }, 5000);
+
       if (myColor === Color.WHITE) {
-        conn.send({ type: 'STATE_UPDATE', state: { ...state, cells: Array.from(state.cells) } });
+        conn.send({ 
+          type: 'STATE_UPDATE', 
+          state: { ...state, cells: Array.from(state.cells) } 
+        });
       }
     });
 
     conn.on('data', (data: any) => {
+      if (data.type === 'HEARTBEAT') return;
+      
       if (data.type === 'STATE_UPDATE') {
         const receivedState = { ...data.state, cells: new Set(data.state.cells) };
         setState(receivedState);
@@ -131,13 +172,25 @@ export default function App() {
 
     conn.on('close', () => {
       setIsConnected(false);
-      setLog(prev => ["Друг отключился.", ...prev]);
+      setLog(prev => ["Соединение закрыто. Ожидание игрока...", ...prev]);
+      setConnection(null);
+    });
+
+    conn.on('error', (err: any) => {
+      console.error("Connection error:", err);
+      setIsConnected(false);
     });
   };
 
   const connectToPeer = () => {
-    if (!remotePeerId || !peerRef.current) return;
-    const conn = peerRef.current.connect(remotePeerId.trim().toUpperCase(), { reliable: true });
+    if (!remotePeerId || !peerRef.current || !peerRef.current.open) {
+      setPeerError("Peer не готов или ID пуст");
+      return;
+    }
+    const conn = peerRef.current.connect(remotePeerId.trim().toUpperCase(), { 
+      reliable: true,
+      connectionPriority: 'high'
+    });
     setConnection(conn);
     setMyColor(Color.BLACK);
     setupConnection(conn);
@@ -159,7 +212,7 @@ export default function App() {
   }, [isConnected, gameOver]);
 
   const syncState = (newState: BoardState, message?: string) => {
-    if (connection?.open) {
+    if (connection && connection.open) {
       connection.send({
         type: 'STATE_UPDATE',
         state: { ...newState, cells: Array.from(newState.cells) },
@@ -202,7 +255,7 @@ export default function App() {
     if (targetPiece?.type === PieceType.KING) {
       const winMsg = `${myColor === Color.WHITE ? "БЕЛЫЕ" : "ЧЕРНЫЕ"} ВЗЯЛИ КОРОЛЯ!`;
       setGameOver(winMsg);
-      connection?.send({ type: 'GAME_OVER', message: winMsg });
+      if (connection?.open) connection.send({ type: 'GAME_OVER', message: winMsg });
     }
 
     setState(newState);
@@ -261,9 +314,10 @@ export default function App() {
         <div className="bg-zinc-900 p-8 rounded-2xl border border-zinc-800 shadow-2xl max-w-md w-full text-center">
           <h1 className="text-3xl font-black text-white mb-6 italic tracking-tighter">Chaotic Chess</h1>
           <div className="space-y-4">
-            <div className="bg-zinc-800 p-4 rounded-xl border border-zinc-700">
+            <div className={`bg-zinc-800 p-4 rounded-xl border ${peerError ? 'border-red-500' : 'border-zinc-700'}`}>
               <p className="text-[10px] font-bold text-zinc-500 uppercase mb-2">Ваш Код:</p>
-              <p className="text-xl font-mono text-yellow-500 font-bold">{peerError || myPeerId || '...'}</p>
+              <p className="text-xl font-mono text-yellow-500 font-bold">{myPeerId || 'ГЕНЕРАЦИЯ...'}</p>
+              {peerError && <p className="text-[9px] text-red-400 mt-2 uppercase">{peerError}</p>}
             </div>
             <input 
               type="text" 
@@ -272,8 +326,15 @@ export default function App() {
               onChange={(e) => setRemotePeerId(e.target.value.toUpperCase())}
               className="w-full bg-zinc-800 border border-zinc-700 p-4 rounded-xl text-white font-mono text-center focus:ring-2 ring-blue-500 outline-none"
             />
-            <button onClick={connectToPeer} className="w-full bg-blue-600 hover:bg-blue-500 text-white font-black py-4 rounded-xl transition-all">ИГРАТЬ ПО СЕТИ</button>
+            <button 
+              onClick={connectToPeer} 
+              disabled={!myPeerId}
+              className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-black py-4 rounded-xl transition-all active:scale-95"
+            >
+              ИГРАТЬ ПО СЕТИ
+            </button>
           </div>
+          <p className="text-[10px] text-zinc-600 mt-6 uppercase tracking-widest">P2P Battle Engine v1.1</p>
         </div>
       </div>
     );
@@ -283,7 +344,7 @@ export default function App() {
     <div className="flex flex-col md:flex-row h-screen p-4 gap-4 bg-zinc-950 text-white overflow-hidden">
       <div className="flex-grow bg-zinc-900 rounded-2xl border border-zinc-800 relative flex items-center justify-center overflow-auto custom-scrollbar">
         <div 
-          className="grid gap-px bg-zinc-800 p-px shadow-2xl"
+          className="grid gap-px bg-zinc-800 p-px shadow-2xl transition-all duration-500"
           style={{
             gridTemplateColumns: `repeat(${boardBounds.width}, 50px)`,
             gridTemplateRows: `repeat(${boardBounds.height}, 50px)`,
@@ -306,13 +367,22 @@ export default function App() {
                   key={key}
                   onClick={() => handleCellClick({x,y})}
                   className={`
-                    w-[50px] h-[50px] flex items-center justify-center text-3xl cursor-pointer transition-colors
-                    ${(x+y)%2 === 0 ? 'bg-zinc-200' : 'bg-zinc-700'}
-                    ${isSelected ? 'ring-4 ring-yellow-400 z-10' : ''}
-                    ${isValid ? 'bg-green-500/50' : ''}
+                    w-[50px] h-[50px] flex items-center justify-center text-3xl cursor-pointer transition-all duration-200
+                    ${(x+y)%2 === 0 ? 'bg-zinc-200 hover:bg-zinc-100' : 'bg-zinc-700 hover:bg-zinc-600'}
+                    ${isSelected ? 'ring-4 ring-yellow-400 z-10 scale-105 shadow-xl' : ''}
+                    ${isValid ? 'relative after:absolute after:w-3 after:h-3 after:bg-green-500/60 after:rounded-full' : ''}
                   `}
                 >
-                  {piece && <span className={piece.color === Color.WHITE ? 'text-white drop-shadow-md' : 'text-zinc-900'}>{PIECE_ICONS[piece.type][piece.color]}</span>}
+                  {piece && (
+                    <span 
+                      className={`
+                        ${piece.color === Color.WHITE ? 'text-white' : 'text-zinc-900'} 
+                        drop-shadow-[0_2px_2px_rgba(0,0,0,0.5)] transform transition-transform hover:scale-110
+                      `}
+                    >
+                      {PIECE_ICONS[piece.type][piece.color]}
+                    </span>
+                  )}
                 </div>
               );
             });
@@ -321,9 +391,15 @@ export default function App() {
 
         {gameOver && (
           <div className="absolute inset-0 bg-black/80 backdrop-blur-md flex flex-col items-center justify-center z-50">
-            <h2 className="text-5xl font-black text-yellow-500 mb-4 italic">КОНЕЦ ИГРЫ</h2>
-            <p className="text-white mb-8 font-bold">{gameOver}</p>
-            <button onClick={() => window.location.reload()} className="bg-white text-black px-8 py-3 rounded-full font-bold">НОВАЯ ИГРА</button>
+            <h2 className="text-5xl font-black text-yellow-500 mb-4 italic animate-bounce">КОНЕЦ ИГРЫ</h2>
+            <p className="text-white mb-8 font-bold text-xl">{gameOver}</p>
+            <button onClick={() => window.location.reload()} className="bg-white text-black px-12 py-4 rounded-full font-black hover:bg-yellow-400 transition-colors">НОВАЯ ИГРА</button>
+          </div>
+        )}
+
+        {peerError && (
+          <div className="absolute top-4 left-1/2 -translate-x-1/2 bg-red-600 px-4 py-2 rounded-full text-[10px] font-bold z-50 animate-pulse uppercase">
+            {peerError}
           </div>
         )}
       </div>
@@ -331,36 +407,49 @@ export default function App() {
       <div className="w-full md:w-80 flex flex-col gap-4">
         <div className="bg-zinc-900 p-4 rounded-2xl border border-zinc-800">
           <div className="flex justify-between items-center mb-4">
-            <span className="text-[10px] font-bold text-zinc-500 uppercase">Статус</span>
-            <div className={`w-2 h-2 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500 animate-pulse'}`}></div>
+            <span className="text-[10px] font-bold text-zinc-500 uppercase">Сетевой Статус</span>
+            <div className={`flex items-center gap-2`}>
+              <span className="text-[9px] uppercase font-bold text-zinc-600">{isConnected ? 'ONLINE' : 'WAITING'}</span>
+              <div className={`w-2.5 h-2.5 rounded-full ${isConnected ? 'bg-green-500 shadow-[0_0_8px_#22c55e]' : 'bg-red-500 animate-pulse'}`}></div>
+            </div>
           </div>
-          <p className="text-xl font-black">{myColor === Color.WHITE ? 'БЕЛЫЕ' : 'ЧЕРНЫХ'}</p>
+          <p className="text-xl font-black">{myColor === Color.WHITE ? 'БЕЛЫЕ' : 'ЧЕРНЫЕ'}</p>
           <p className={`text-xs mt-1 ${state.turn === myColor ? 'text-green-500 font-bold' : 'text-zinc-500'}`}>
-            {state.turn === myColor ? 'Ваш ход' : 'Ход противника'}
+            {state.turn === myColor ? '● Ваш ход' : '○ Ход противника'}
           </p>
         </div>
 
         <div className="bg-zinc-900 p-4 rounded-2xl border border-zinc-800">
-          <p className="text-[10px] font-bold text-zinc-500 uppercase mb-2">Золото</p>
-          <p className="text-3xl font-mono text-yellow-500 font-black">{state.gold[myColor!].toFixed(1)}</p>
+          <p className="text-[10px] font-bold text-zinc-500 uppercase mb-2">Ваша Казна</p>
+          <div className="flex items-baseline gap-2">
+            <p className="text-3xl font-mono text-yellow-500 font-black">{state.gold[myColor!].toFixed(1)}</p>
+            <span className="text-xs text-yellow-600 font-bold">G</span>
+          </div>
         </div>
 
-        <div className="bg-zinc-900 p-4 rounded-2xl border border-zinc-800 grid grid-cols-2 gap-2">
-          {Object.entries(PIECE_COSTS).filter(([t]) => t !== 'king').map(([type, cost]) => (
-            <button 
-              key={type}
-              onClick={() => setShopActive(shopActive === type ? null : type as PieceType)}
-              disabled={state.gold[myColor!] < cost}
-              className={`p-2 rounded-xl border text-xs flex flex-col items-center gap-1 transition-all ${shopActive === type ? 'bg-blue-600 border-blue-400' : 'bg-zinc-800 border-zinc-700'}`}
-            >
-              <span className="text-xl">{PIECE_ICONS[type as PieceType][myColor!]}</span>
-              <span className="font-bold text-yellow-500">{cost}</span>
-            </button>
-          ))}
+        <div className="bg-zinc-900 p-4 rounded-2xl border border-zinc-800 flex flex-col gap-3">
+          <p className="text-[10px] font-bold text-zinc-500 uppercase">Магазин Фигур</p>
+          <div className="grid grid-cols-2 gap-2">
+            {Object.entries(PIECE_COSTS).filter(([t]) => t !== 'king').map(([type, cost]) => (
+              <button 
+                key={type}
+                onClick={() => setShopActive(shopActive === type ? null : type as PieceType)}
+                disabled={state.gold[myColor!] < cost || state.turn !== myColor || !isConnected}
+                className={`p-2 rounded-xl border text-xs flex flex-col items-center gap-1 transition-all ${shopActive === type ? 'bg-blue-600 border-blue-400 scale-105 shadow-lg' : 'bg-zinc-800 border-zinc-700 hover:border-zinc-500'} disabled:opacity-30 disabled:grayscale`}
+              >
+                <span className="text-2xl">{PIECE_ICONS[type as PieceType][myColor!]}</span>
+                <span className="font-bold text-yellow-500">{cost} G</span>
+              </button>
+            ))}
+          </div>
+          {shopActive && <p className="text-[9px] text-blue-400 font-bold text-center uppercase animate-pulse">Выберите клетку на поле</p>}
         </div>
 
-        <div className="flex-grow bg-zinc-900 p-4 rounded-2xl border border-zinc-800 overflow-y-auto font-mono text-[10px] text-zinc-500 space-y-1">
-          {log.map((l, i) => <div key={i} className="p-2 bg-zinc-950/50 rounded">{l}</div>)}
+        <div className="flex-grow bg-zinc-900 p-4 rounded-2xl border border-zinc-800 overflow-hidden flex flex-col">
+          <p className="text-[10px] font-bold text-zinc-500 uppercase mb-3">Лог Сражения</p>
+          <div className="flex-grow overflow-y-auto font-mono text-[10px] text-zinc-500 space-y-1 custom-scrollbar pr-2">
+            {log.map((l, i) => <div key={i} className="p-2 bg-zinc-950/50 rounded border-l-2 border-zinc-800">{l}</div>)}
+          </div>
         </div>
       </div>
     </div>
