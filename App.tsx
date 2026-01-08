@@ -3,7 +3,8 @@ import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { Color, PieceType, Position, Piece, BoardState, Move, PIECE_COSTS } from './types';
 import { ChessEngine, posToKey, keyToPos } from './logic/chessLogic';
 
-declare const Peer: any;
+// Безопасное получение Peer из глобальной области
+const getPeerClass = () => (window as any).Peer;
 
 const INITIAL_SIZE = 8;
 const createInitialState = (): BoardState => {
@@ -37,10 +38,9 @@ export default function App() {
   const [state, setState] = useState<BoardState>(createInitialState());
   const [selected, setSelected] = useState<Position | null>(null);
   const [validMoves, setValidMoves] = useState<Position[]>([]);
-  const [log, setLog] = useState<string[]>(["Добро пожаловать!"]);
+  const [log, setLog] = useState<string[]>(["Система инициализирована."]);
   const [gameOver, setGameOver] = useState<string | null>(null);
-  const [shopActive, setShopActive] = useState<PieceType | null>(null);
-
+  
   const [isPeerLibReady, setIsPeerLibReady] = useState(false);
   const [myPeerId, setMyPeerId] = useState<string>('');
   const [remotePeerId, setRemotePeerId] = useState<string>('');
@@ -48,58 +48,60 @@ export default function App() {
   const [myColor, setMyColor] = useState<Color | null>(null);
   const [peerError, setPeerError] = useState<string | null>(null);
   const [isConnected, setIsConnected] = useState(false);
+  const [isConnecting, setIsConnecting] = useState(false);
   
   const peerRef = useRef<any>(null);
-  const retryTimerRef = useRef<number | null>(null);
+  const heartbeatIntervalRef = useRef<any>(null);
 
+  // 1. Ожидание загрузки скрипта PeerJS
   useEffect(() => {
-    const checkPeer = setInterval(() => {
-      if (typeof Peer !== 'undefined') {
+    const checkInterval = setInterval(() => {
+      if (getPeerClass()) {
         setIsPeerLibReady(true);
-        clearInterval(checkPeer);
+        clearInterval(checkInterval);
       }
     }, 100);
-    return () => clearInterval(checkPeer);
+    return () => clearInterval(checkInterval);
   }, []);
 
+  // 2. Инициализация основного Peer объекта
   const initPeer = () => {
-    if (typeof Peer === 'undefined') return;
+    const PeerClass = getPeerClass();
+    if (!PeerClass) return;
+
     if (peerRef.current) {
       peerRef.current.destroy();
     }
     
     setPeerError(null);
+    const newId = generateShortId();
 
-    const peer = new Peer(generateShortId(), {
+    // Используем настройки для повышения стабильности соединения
+    const peer = new PeerClass(newId, {
+      debug: 1,
       host: '0.peerjs.com',
       port: 443,
       secure: true,
-      debug: 1,
       config: {
         'iceServers': [
           { urls: 'stun:stun.l.google.com:19302' },
           { urls: 'stun:stun1.l.google.com:19302' }
-        ]
+        ],
+        'sdpSemantics': 'unified-plan'
       }
     });
     
     peerRef.current = peer;
 
     peer.on('open', (id: string) => {
+      console.log('Peer открыт:', id);
       setMyPeerId(id);
       setPeerError(null);
-      if (retryTimerRef.current) {
-        window.clearTimeout(retryTimerRef.current);
-        retryTimerRef.current = null;
-      }
     });
 
     peer.on('connection', (conn: any) => {
-      // If we are already in game, don't allow new connections unless closed
-      if (connection && connection.open) {
-        conn.close();
-        return;
-      }
+      console.log('Входящее соединение...');
+      if (connection) connection.close();
       setConnection(conn);
       setMyColor(Color.WHITE);
       setupConnection(conn);
@@ -107,23 +109,22 @@ export default function App() {
 
     peer.on('error', (err: any) => {
       console.error('PeerJS Error:', err.type, err);
-      const errorMsg = `Ошибка: ${err.type}`;
-      
-      if (err.type === 'network' || err.type === 'server-error' || err.type === 'disconnected') {
-        setPeerError('Проблема с сетью. Переподключение...');
-        if (!retryTimerRef.current) {
-          retryTimerRef.current = window.setTimeout(() => {
-            retryTimerRef.current = null;
-            initPeer();
-          }, 3000);
-        }
+      if (err.type === 'network' || err.type === 'server-error' || err.type === 'lost-connection') {
+        setPeerError('Связь с сервером потеряна. Переподключение...');
+        setTimeout(initPeer, 3000);
+      } else if (err.type === 'unavailable-id') {
+        initPeer();
+      } else if (err.type === 'peer-not-found') {
+        setPeerError('Игрок с таким кодом не найден.');
+        setIsConnecting(false);
       } else {
-        setPeerError(errorMsg);
+        setPeerError(`Ошибка системы: ${err.type}`);
+        setIsConnecting(false);
       }
     });
 
     peer.on('disconnected', () => {
-      setPeerError('Потеряна связь с сервером. Восстановление...');
+      console.log('Peer отключен от сервера сигналов. Пробуем вернуть связь...');
       peer.reconnect();
     });
   };
@@ -131,37 +132,35 @@ export default function App() {
   useEffect(() => {
     if (isPeerLibReady) initPeer();
     return () => {
+      if (heartbeatIntervalRef.current) clearInterval(heartbeatIntervalRef.current);
       peerRef.current?.destroy();
-      if (retryTimerRef.current) window.clearTimeout(retryTimerRef.current);
     };
   }, [isPeerLibReady]);
 
+  // 3. Настройка конкретного соединения (DataConnection)
   const setupConnection = (conn: any) => {
     conn.on('open', () => {
       setIsConnected(true);
+      setIsConnecting(false);
       setPeerError(null);
-      setLog(prev => ["Связь с игроком установлена!", ...prev]);
+      setLog(prev => ["Второй игрок подключился!", ...prev]);
       
-      // Heartbeat to keep connection alive
-      const heartbeat = setInterval(() => {
+      // Запуск Heartbeat (пингование), чтобы соединение не "засыпало"
+      if (heartbeatIntervalRef.current) clearInterval(heartbeatIntervalRef.current);
+      heartbeatIntervalRef.current = setInterval(() => {
         if (conn.open) {
-          conn.send({ type: 'HEARTBEAT' });
-        } else {
-          clearInterval(heartbeat);
+          conn.send({ type: 'PING' });
         }
       }, 5000);
 
       if (myColor === Color.WHITE) {
-        conn.send({ 
-          type: 'STATE_UPDATE', 
-          state: { ...state, cells: Array.from(state.cells) } 
-        });
+        conn.send({ type: 'STATE_UPDATE', state: { ...state, cells: Array.from(state.cells) } });
       }
     });
 
     conn.on('data', (data: any) => {
-      if (data.type === 'HEARTBEAT') return;
-      
+      if (data.type === 'PING') return; // Игнорируем пинг
+
       if (data.type === 'STATE_UPDATE') {
         const receivedState = { ...data.state, cells: new Set(data.state.cells) };
         setState(receivedState);
@@ -172,53 +171,39 @@ export default function App() {
 
     conn.on('close', () => {
       setIsConnected(false);
-      setLog(prev => ["Соединение закрыто. Ожидание игрока...", ...prev]);
       setConnection(null);
+      setLog(prev => ["Связь с игроком потеряна.", ...prev]);
+      if (heartbeatIntervalRef.current) clearInterval(heartbeatIntervalRef.current);
     });
 
     conn.on('error', (err: any) => {
-      console.error("Connection error:", err);
+      console.error('Connection Data Error:', err);
       setIsConnected(false);
+      setIsConnecting(false);
     });
   };
 
   const connectToPeer = () => {
-    if (!remotePeerId || !peerRef.current || !peerRef.current.open) {
-      setPeerError("Peer не готов или ID пуст");
-      return;
-    }
-    const conn = peerRef.current.connect(remotePeerId.trim().toUpperCase(), { 
-      reliable: true,
-      connectionPriority: 'high'
+    if (!remotePeerId || !peerRef.current || isConnecting) return;
+    
+    setIsConnecting(true);
+    setPeerError(null);
+    
+    const conn = peerRef.current.connect(remotePeerId.trim().toUpperCase(), {
+      reliable: true
     });
+    
     setConnection(conn);
     setMyColor(Color.BLACK);
     setupConnection(conn);
-  };
-
-  // Экономика
-  useEffect(() => {
-    if (!isConnected || gameOver) return;
-    const interval = setInterval(() => {
-      setState(prev => ({
-        ...prev,
-        gold: {
-          [Color.WHITE]: prev.gold[Color.WHITE] + 0.25,
-          [Color.BLACK]: prev.gold[Color.BLACK] + 0.25,
-        }
-      }));
-    }, 8000);
-    return () => clearInterval(interval);
-  }, [isConnected, gameOver]);
-
-  const syncState = (newState: BoardState, message?: string) => {
-    if (connection && connection.open) {
-      connection.send({
-        type: 'STATE_UPDATE',
-        state: { ...newState, cells: Array.from(newState.cells) },
-        log: message
-      });
-    }
+    
+    // Таймаут на подключение
+    setTimeout(() => {
+      if (!conn.open && isConnecting) {
+        setIsConnecting(false);
+        setPeerError('Превышено время ожидания подключения.');
+      }
+    }, 10000);
   };
 
   const boardBounds = useMemo(() => {
@@ -231,68 +216,45 @@ export default function App() {
     return { minX, maxX, minY, maxY, width: maxX - minX + 1, height: maxY - minY + 1 };
   }, [state.cells]);
 
-  const executeMove = (from: Position, to: Position) => {
-    const activePiece = state.pieces.find(p => p.pos.x === from.x && p.pos.y === from.y)!;
-    const targetPiece = state.pieces.find(p => p.pos.x === to.x && p.pos.y === to.y);
-
-    let nextPieces = state.pieces
-      .filter(p => !(p.pos.x === to.x && p.pos.y === to.y))
-      .map(p => (p.pos.x === from.x && p.pos.y === from.y) ? { ...p, pos: to, hasMoved: true } : p);
-
-    const nextTurn = state.turn === Color.WHITE ? Color.BLACK : Color.WHITE;
-    let newState: BoardState = {
-      ...state,
-      pieces: nextPieces,
-      turn: nextTurn,
-      lastMove: { from, to, piece: activePiece, captured: targetPiece }
-    };
-
-    if (Math.random() < 0.1) {
-      const { newCells } = ChessEngine.expandBoard(state.cells);
-      newState.cells = newCells;
-    }
-
-    if (targetPiece?.type === PieceType.KING) {
-      const winMsg = `${myColor === Color.WHITE ? "БЕЛЫЕ" : "ЧЕРНЫЕ"} ВЗЯЛИ КОРОЛЯ!`;
-      setGameOver(winMsg);
-      if (connection?.open) connection.send({ type: 'GAME_OVER', message: winMsg });
-    }
-
-    setState(newState);
-    syncState(newState);
-    setSelected(null);
-    setValidMoves([]);
-  };
-
   const handleCellClick = (pos: Position) => {
     if (gameOver || state.turn !== myColor || !isConnected) return;
-
-    if (shopActive) {
-      const cost = PIECE_COSTS[shopActive];
-      if (state.gold[myColor] >= cost) {
-        const newPiece: Piece = {
-          id: `buy-${Date.now()}`,
-          type: shopActive,
-          color: myColor,
-          pos,
-          hasMoved: false
-        };
-        const newState = {
-          ...state,
-          pieces: [...state.pieces, newPiece],
-          gold: { ...state.gold, [myColor]: state.gold[myColor] - cost }
-        };
-        setState(newState);
-        syncState(newState, `Куплен ${shopActive}`);
-        setShopActive(null);
-      }
-      return;
-    }
-
+    
     const piece = state.pieces.find(p => p.pos.x === pos.x && p.pos.y === pos.y);
     if (selected) {
       if (validMoves.some(m => m.x === pos.x && m.y === pos.y)) {
-        executeMove(selected, pos);
+        const activePiece = state.pieces.find(p => p.pos.x === selected.x && p.pos.y === selected.y)!;
+        const targetPiece = state.pieces.find(p => p.pos.x === pos.x && p.pos.y === pos.y);
+        
+        let nextPieces = state.pieces
+          .filter(p => !(p.pos.x === pos.x && p.pos.y === pos.y))
+          .map(p => (p.pos.x === selected.x && p.pos.y === selected.y) ? { ...p, pos, hasMoved: true } : p);
+        
+        const nextTurn = state.turn === Color.WHITE ? Color.BLACK : Color.WHITE;
+        let newState = { ...state, pieces: nextPieces, turn: nextTurn };
+
+        // Логика победы
+        if (targetPiece?.type === PieceType.KING) {
+          const msg = `Король ${targetPiece.color === Color.WHITE ? 'Белых' : 'Черных'} пал!`;
+          setGameOver(msg);
+          if (connection?.open) connection.send({ type: 'GAME_OVER', message: msg });
+        }
+
+        // Шанс расширения поля
+        if (Math.random() < 0.15) {
+          const { newCells } = ChessEngine.expandBoard(state.cells);
+          newState.cells = newCells;
+        }
+
+        setState(newState);
+        if (connection?.open) {
+          connection.send({ 
+            type: 'STATE_UPDATE', 
+            state: { ...newState, cells: Array.from(newState.cells) },
+            log: `${activePiece.type} на ${pos.x},${pos.y}`
+          });
+        }
+        setSelected(null);
+        setValidMoves([]);
         return;
       }
     }
@@ -306,48 +268,77 @@ export default function App() {
     }
   };
 
-  if (!isPeerLibReady) return <div className="h-screen bg-zinc-950 flex items-center justify-center text-zinc-500 font-mono">ЗАГРУЗКА ПЛАТФОРМЫ...</div>;
+  // Экран загрузки библиотеки
+  if (!isPeerLibReady) {
+    return (
+      <div className="fixed inset-0 bg-zinc-950 flex flex-col items-center justify-center text-zinc-500 font-mono">
+        <div className="w-10 h-10 border-2 border-zinc-800 border-t-blue-500 rounded-full animate-spin mb-4"></div>
+        <p className="text-sm tracking-widest animate-pulse">CONNECTING TO NETWORK...</p>
+      </div>
+    );
+  }
 
+  // Экран входа / Главное меню
   if (!myColor) {
     return (
-      <div className="flex items-center justify-center h-screen bg-zinc-950 p-6">
-        <div className="bg-zinc-900 p-8 rounded-2xl border border-zinc-800 shadow-2xl max-w-md w-full text-center">
-          <h1 className="text-3xl font-black text-white mb-6 italic tracking-tighter">Chaotic Chess</h1>
-          <div className="space-y-4">
-            <div className={`bg-zinc-800 p-4 rounded-xl border ${peerError ? 'border-red-500' : 'border-zinc-700'}`}>
-              <p className="text-[10px] font-bold text-zinc-500 uppercase mb-2">Ваш Код:</p>
-              <p className="text-xl font-mono text-yellow-500 font-bold">{myPeerId || 'ГЕНЕРАЦИЯ...'}</p>
-              {peerError && <p className="text-[9px] text-red-400 mt-2 uppercase">{peerError}</p>}
+      <div className="fixed inset-0 bg-zinc-950 flex items-center justify-center p-6 overflow-hidden">
+        <div className="max-w-md w-full bg-zinc-900/50 backdrop-blur-xl border border-zinc-800 p-10 rounded-[2.5rem] shadow-2xl relative overflow-hidden">
+          <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-blue-500 to-transparent opacity-50"></div>
+          
+          <h1 className="text-5xl font-black text-white mb-2 italic tracking-tighter">CHAOTIC CHESS</h1>
+          <p className="text-zinc-500 text-[10px] uppercase tracking-[0.4em] mb-10 pl-1">Quantum Matchmaking v2</p>
+          
+          <div className="space-y-8">
+            <div className="bg-zinc-950/80 p-5 rounded-3xl border border-zinc-800/50">
+              <span className="text-[10px] text-zinc-600 font-black uppercase tracking-widest block mb-2">Твой секретный код:</span>
+              <div className="flex items-center justify-between">
+                <p className="text-3xl font-mono text-blue-400 font-bold tracking-widest">{myPeerId || '...'}</p>
+                <div className={`w-2 h-2 rounded-full ${myPeerId ? 'bg-green-500 shadow-[0_0_10px_#22c55e]' : 'bg-zinc-800 animate-pulse'}`}></div>
+              </div>
             </div>
-            <input 
-              type="text" 
-              placeholder="КОД ДРУГА"
-              value={remotePeerId}
-              onChange={(e) => setRemotePeerId(e.target.value.toUpperCase())}
-              className="w-full bg-zinc-800 border border-zinc-700 p-4 rounded-xl text-white font-mono text-center focus:ring-2 ring-blue-500 outline-none"
-            />
-            <button 
-              onClick={connectToPeer} 
-              disabled={!myPeerId}
-              className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-black py-4 rounded-xl transition-all active:scale-95"
-            >
-              ИГРАТЬ ПО СЕТИ
-            </button>
+
+            <div className="space-y-4">
+              <input 
+                type="text" 
+                placeholder="ВВЕДИ КОД ДРУГА" 
+                value={remotePeerId}
+                disabled={isConnecting}
+                onChange={e => setRemotePeerId(e.target.value.toUpperCase())}
+                className="w-full bg-zinc-800/50 border border-zinc-700/50 p-5 rounded-3xl text-white font-mono text-center outline-none focus:ring-2 ring-blue-500/50 transition-all text-xl"
+              />
+              <button 
+                onClick={connectToPeer}
+                disabled={!myPeerId || isConnecting || !remotePeerId}
+                className="w-full bg-white text-black font-black py-5 rounded-3xl hover:bg-blue-500 hover:text-white transition-all transform active:scale-95 disabled:opacity-30 disabled:grayscale text-lg shadow-xl shadow-black/20"
+              >
+                {isConnecting ? 'ПОДКЛЮЧЕНИЕ...' : 'В БОЙ'}
+              </button>
+            </div>
+
+            {peerError && (
+              <div className="bg-red-500/10 border border-red-500/20 p-4 rounded-2xl">
+                <p className="text-red-400 text-[11px] uppercase font-black text-center leading-relaxed italic">{peerError}</p>
+              </div>
+            )}
           </div>
-          <p className="text-[10px] text-zinc-600 mt-6 uppercase tracking-widest">P2P Battle Engine v1.1</p>
+          
+          <div className="mt-10 pt-6 border-t border-zinc-800/50 text-center">
+            <p className="text-[9px] text-zinc-600 uppercase tracking-widest font-bold">Ожидайте загрузки кода перед началом</p>
+          </div>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="flex flex-col md:flex-row h-screen p-4 gap-4 bg-zinc-950 text-white overflow-hidden">
-      <div className="flex-grow bg-zinc-900 rounded-2xl border border-zinc-800 relative flex items-center justify-center overflow-auto custom-scrollbar">
+    <div className="h-screen w-screen flex flex-col md:flex-row bg-zinc-950 text-white p-4 gap-4 overflow-hidden">
+      {/* Игровое поле */}
+      <div className="flex-grow bg-zinc-900 rounded-[2rem] border border-zinc-800 relative flex items-center justify-center overflow-auto custom-scrollbar shadow-inner">
         <div 
-          className="grid gap-px bg-zinc-800 p-px shadow-2xl transition-all duration-500"
+          className="grid gap-px bg-zinc-800 p-px shadow-2xl transition-all duration-700"
           style={{
-            gridTemplateColumns: `repeat(${boardBounds.width}, 50px)`,
-            gridTemplateRows: `repeat(${boardBounds.height}, 50px)`,
+            gridTemplateColumns: `repeat(${boardBounds.width}, 52px)`,
+            gridTemplateRows: `repeat(${boardBounds.height}, 52px)`,
           }}
         >
           {Array.from({ length: boardBounds.height }).map((_, r) => {
@@ -360,95 +351,68 @@ export default function App() {
               const isSelected = selected?.x === x && selected?.y === y;
               const isValid = validMoves.some(m => m.x === x && m.y === y);
 
-              if (!exists) return <div key={key} className="w-[50px] h-[50px] bg-zinc-950/20" />;
+              if (!exists) return <div key={key} className="w-[52px] h-[52px] bg-zinc-950/10" />;
 
               return (
                 <div 
                   key={key}
                   onClick={() => handleCellClick({x,y})}
-                  className={`
-                    w-[50px] h-[50px] flex items-center justify-center text-3xl cursor-pointer transition-all duration-200
-                    ${(x+y)%2 === 0 ? 'bg-zinc-200 hover:bg-zinc-100' : 'bg-zinc-700 hover:bg-zinc-600'}
-                    ${isSelected ? 'ring-4 ring-yellow-400 z-10 scale-105 shadow-xl' : ''}
-                    ${isValid ? 'relative after:absolute after:w-3 after:h-3 after:bg-green-500/60 after:rounded-full' : ''}
+                  className={`w-[52px] h-[52px] flex items-center justify-center text-3xl cursor-pointer transition-all duration-200
+                    ${(x+y)%2 === 0 ? 'bg-zinc-200 hover:bg-white' : 'bg-zinc-700 hover:bg-zinc-600'}
+                    ${isSelected ? 'ring-4 ring-yellow-400 z-10 scale-105' : ''}
+                    ${isValid ? 'relative after:absolute after:w-3 after:h-3 after:bg-green-500/60 after:rounded-full after:animate-pulse' : ''}
                   `}
                 >
                   {piece && (
-                    <span 
-                      className={`
-                        ${piece.color === Color.WHITE ? 'text-white' : 'text-zinc-900'} 
-                        drop-shadow-[0_2px_2px_rgba(0,0,0,0.5)] transform transition-transform hover:scale-110
-                      `}
-                    >
+                    <span className={`
+                      ${piece.color === Color.WHITE ? 'text-white' : 'text-zinc-900'} 
+                      drop-shadow-lg select-none transform transition-transform hover:scale-110 active:scale-90
+                    `}>
                       {PIECE_ICONS[piece.type][piece.color]}
                     </span>
                   )}
                 </div>
               );
-            });
-          })}
+            })}
+          )}
         </div>
 
         {gameOver && (
-          <div className="absolute inset-0 bg-black/80 backdrop-blur-md flex flex-col items-center justify-center z-50">
-            <h2 className="text-5xl font-black text-yellow-500 mb-4 italic animate-bounce">КОНЕЦ ИГРЫ</h2>
-            <p className="text-white mb-8 font-bold text-xl">{gameOver}</p>
-            <button onClick={() => window.location.reload()} className="bg-white text-black px-12 py-4 rounded-full font-black hover:bg-yellow-400 transition-colors">НОВАЯ ИГРА</button>
-          </div>
-        )}
-
-        {peerError && (
-          <div className="absolute top-4 left-1/2 -translate-x-1/2 bg-red-600 px-4 py-2 rounded-full text-[10px] font-bold z-50 animate-pulse uppercase">
-            {peerError}
+          <div className="absolute inset-0 bg-black/90 backdrop-blur-md flex flex-col items-center justify-center z-50 p-6 text-center">
+            <h2 className="text-6xl font-black text-yellow-500 mb-6 italic animate-bounce tracking-tighter">VICTORY</h2>
+            <p className="text-white mb-10 font-bold text-2xl uppercase tracking-widest">{gameOver}</p>
+            <button onClick={() => window.location.reload()} className="bg-white text-black px-12 py-5 rounded-full font-black hover:bg-yellow-400 transition-all text-xl shadow-2xl">REMATCH</button>
           </div>
         )}
       </div>
 
+      {/* Панель управления */}
       <div className="w-full md:w-80 flex flex-col gap-4">
-        <div className="bg-zinc-900 p-4 rounded-2xl border border-zinc-800">
-          <div className="flex justify-between items-center mb-4">
-            <span className="text-[10px] font-bold text-zinc-500 uppercase">Сетевой Статус</span>
-            <div className={`flex items-center gap-2`}>
-              <span className="text-[9px] uppercase font-bold text-zinc-600">{isConnected ? 'ONLINE' : 'WAITING'}</span>
-              <div className={`w-2.5 h-2.5 rounded-full ${isConnected ? 'bg-green-500 shadow-[0_0_8px_#22c55e]' : 'bg-red-500 animate-pulse'}`}></div>
+        <div className="bg-zinc-900 p-6 rounded-[2rem] border border-zinc-800 shadow-xl">
+          <div className="flex justify-between items-center mb-6">
+            <span className="text-[10px] font-black text-zinc-500 uppercase tracking-widest">P2P Network</span>
+            <div className="flex items-center gap-2">
+               <span className="text-[9px] text-zinc-600 font-bold">{isConnected ? 'STABLE' : 'LOST'}</span>
+               <div className={`w-2.5 h-2.5 rounded-full ${isConnected ? 'bg-green-500 shadow-[0_0_10px_#22c55e]' : 'bg-red-500 animate-pulse'}`}></div>
             </div>
           </div>
-          <p className="text-xl font-black">{myColor === Color.WHITE ? 'БЕЛЫЕ' : 'ЧЕРНЫЕ'}</p>
-          <p className={`text-xs mt-1 ${state.turn === myColor ? 'text-green-500 font-bold' : 'text-zinc-500'}`}>
-            {state.turn === myColor ? '● Ваш ход' : '○ Ход противника'}
-          </p>
-        </div>
-
-        <div className="bg-zinc-900 p-4 rounded-2xl border border-zinc-800">
-          <p className="text-[10px] font-bold text-zinc-500 uppercase mb-2">Ваша Казна</p>
-          <div className="flex items-baseline gap-2">
-            <p className="text-3xl font-mono text-yellow-500 font-black">{state.gold[myColor!].toFixed(1)}</p>
-            <span className="text-xs text-yellow-600 font-bold">G</span>
+          <div className="flex flex-col gap-1">
+            <p className="text-3xl font-black italic tracking-tighter">{myColor === Color.WHITE ? 'БЕЛЫЕ' : 'ЧЕРНЫЕ'}</p>
+            <p className={`text-[11px] uppercase font-bold tracking-widest ${state.turn === myColor ? 'text-blue-500' : 'text-zinc-600'}`}>
+              {state.turn === myColor ? '● Твой ход' : '○ Ожидание игрока...'}
+            </p>
           </div>
         </div>
 
-        <div className="bg-zinc-900 p-4 rounded-2xl border border-zinc-800 flex flex-col gap-3">
-          <p className="text-[10px] font-bold text-zinc-500 uppercase">Магазин Фигур</p>
-          <div className="grid grid-cols-2 gap-2">
-            {Object.entries(PIECE_COSTS).filter(([t]) => t !== 'king').map(([type, cost]) => (
-              <button 
-                key={type}
-                onClick={() => setShopActive(shopActive === type ? null : type as PieceType)}
-                disabled={state.gold[myColor!] < cost || state.turn !== myColor || !isConnected}
-                className={`p-2 rounded-xl border text-xs flex flex-col items-center gap-1 transition-all ${shopActive === type ? 'bg-blue-600 border-blue-400 scale-105 shadow-lg' : 'bg-zinc-800 border-zinc-700 hover:border-zinc-500'} disabled:opacity-30 disabled:grayscale`}
-              >
-                <span className="text-2xl">{PIECE_ICONS[type as PieceType][myColor!]}</span>
-                <span className="font-bold text-yellow-500">{cost} G</span>
-              </button>
+        <div className="flex-grow bg-zinc-900 p-6 rounded-[2rem] border border-zinc-800 overflow-hidden flex flex-col shadow-xl">
+          <p className="text-[10px] font-black text-zinc-500 uppercase tracking-widest mb-5">Battle Logs</p>
+          <div className="flex-grow overflow-y-auto space-y-3 pr-2 custom-scrollbar">
+            {log.length === 0 && <p className="text-zinc-700 italic text-[10px]">История пуста...</p>}
+            {log.map((entry, i) => (
+              <div key={i} className="p-3 bg-zinc-950/50 rounded-2xl border-l-4 border-zinc-800 text-[10px] font-mono text-zinc-400 animate-fadeIn">
+                <span className="text-zinc-600 mr-2">[{log.length - i}]</span> {entry}
+              </div>
             ))}
-          </div>
-          {shopActive && <p className="text-[9px] text-blue-400 font-bold text-center uppercase animate-pulse">Выберите клетку на поле</p>}
-        </div>
-
-        <div className="flex-grow bg-zinc-900 p-4 rounded-2xl border border-zinc-800 overflow-hidden flex flex-col">
-          <p className="text-[10px] font-bold text-zinc-500 uppercase mb-3">Лог Сражения</p>
-          <div className="flex-grow overflow-y-auto font-mono text-[10px] text-zinc-500 space-y-1 custom-scrollbar pr-2">
-            {log.map((l, i) => <div key={i} className="p-2 bg-zinc-950/50 rounded border-l-2 border-zinc-800">{l}</div>)}
           </div>
         </div>
       </div>
