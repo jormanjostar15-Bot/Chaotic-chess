@@ -3,7 +3,6 @@ import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { Color, PieceType, Position, Piece, BoardState, Move, PIECE_COSTS } from './types';
 import { ChessEngine, posToKey, keyToPos } from './logic/chessLogic';
 
-// Указываем TypeScript, что Peer берется из глобального окна (CDN)
 declare const Peer: any;
 
 const INITIAL_SIZE = 8;
@@ -49,10 +48,10 @@ export default function App() {
   const [connection, setConnection] = useState<any>(null);
   const [myColor, setMyColor] = useState<Color | null>(null);
   const [peerError, setPeerError] = useState<string | null>(null);
-  const [isRetrying, setIsRetrying] = useState(false);
+  const [isConnected, setIsConnected] = useState(false);
+  
   const peerRef = useRef<any>(null);
 
-  // 1. Проверяем наличие библиотеки PeerJS в окне (CDN может грузиться долго)
   useEffect(() => {
     const checkPeer = setInterval(() => {
       if (typeof Peer !== 'undefined') {
@@ -65,78 +64,75 @@ export default function App() {
 
   const initPeer = () => {
     if (typeof Peer === 'undefined') return;
-    if (peerRef.current) {
-      peerRef.current.destroy();
-    }
+    if (peerRef.current) peerRef.current.destroy();
     
     setPeerError(null);
     setMyPeerId('');
-    setIsRetrying(false);
 
-    try {
-      const peer = new Peer(generateShortId(), {
-        host: '0.peerjs.com',
-        port: 443,
-        secure: true,
-        debug: 1,
-        pingInterval: 3000,
-        config: {
-          'iceServers': [
-            { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:stun1.l.google.com:19302' }
-          ]
-        }
-      });
-      
-      peerRef.current = peer;
+    const peer = new Peer(generateShortId(), {
+      host: '0.peerjs.com',
+      port: 443,
+      secure: true,
+      debug: 1,
+      pingInterval: 3000,
+    });
+    
+    peerRef.current = peer;
 
-      peer.on('open', (id: string) => {
-        setMyPeerId(id);
-        setIsRetrying(false);
-      });
+    peer.on('open', (id: string) => setMyPeerId(id));
 
-      peer.on('connection', (conn: any) => {
-        setConnection(conn);
-        setMyColor(Color.WHITE);
-        setLog(prev => ["Друг подключился! Вы — Белые.", ...prev]);
-        setupConnection(conn);
-      });
+    peer.on('connection', (conn: any) => {
+      if (connection) connection.close();
+      setConnection(conn);
+      setMyColor(Color.WHITE);
+      setupConnection(conn);
+    });
 
-      peer.on('error', (err: any) => {
-        console.error('PeerJS Error:', err.type);
-        if (err.type === 'server-error' || err.type === 'network') {
-          setPeerError('Ошибка сети. Пробуем снова...');
-          setIsRetrying(true);
-          setTimeout(() => initPeer(), 4000);
-        } else {
-          setPeerError(`Ошибка: ${err.type}`);
-        }
-      });
+    peer.on('error', (err: any) => {
+      console.error('PeerJS Error:', err.type);
+      if (err.type === 'network' || err.type === 'server-error') {
+        setPeerError('Ошибка сети. Переподключение...');
+        setTimeout(() => initPeer(), 5000);
+      } else if (err.type === 'disconnected') {
+        peer.reconnect();
+      } else {
+        setPeerError(`Ошибка: ${err.type}`);
+      }
+    });
 
-    } catch (e) {
-      setPeerError('Ошибка инициализации');
-    }
+    peer.on('disconnected', () => {
+      setLog(prev => ["Отключено от сервера. Пробуем вернуть связь...", ...prev]);
+      peer.reconnect();
+    });
   };
 
   useEffect(() => {
-    if (isPeerLibReady) {
-      initPeer();
-    }
-    return () => {
-      if (peerRef.current) peerRef.current.destroy();
-    };
+    if (isPeerLibReady) initPeer();
+    return () => peerRef.current?.destroy();
   }, [isPeerLibReady]);
 
   const setupConnection = (conn: any) => {
+    conn.on('open', () => {
+      setIsConnected(true);
+      setLog(prev => ["Связь установлена!", ...prev]);
+      if (myColor === Color.WHITE) {
+        conn.send({ type: 'STATE_UPDATE', state: { ...state, cells: Array.from(state.cells) } });
+      }
+    });
+
     conn.on('data', (data: any) => {
       if (data.type === 'STATE_UPDATE') {
-        const receivedState = data.state;
-        receivedState.cells = new Set(data.state.cells);
+        const receivedState = { ...data.state, cells: new Set(data.state.cells) };
         setState(receivedState);
+        if (data.log) setLog(prev => [data.log, ...prev.slice(0, 15)]);
       }
       if (data.type === 'GAME_OVER') setGameOver(data.message);
     });
-    conn.on('close', () => setConnection(null));
+
+    conn.on('close', () => {
+      setIsConnected(false);
+      setLog(prev => ["Друг отключился.", ...prev]);
+    });
   };
 
   const connectToPeer = () => {
@@ -144,67 +140,37 @@ export default function App() {
     const conn = peerRef.current.connect(remotePeerId.trim().toUpperCase(), { reliable: true });
     setConnection(conn);
     setMyColor(Color.BLACK);
-    setLog(prev => ["Подключение к другу...", ...prev]);
     setupConnection(conn);
   };
 
-  // Если библиотека еще не загрузилась, показываем экран загрузки (не черный!)
-  if (!isPeerLibReady) {
-    return (
-      <div className="flex items-center justify-center h-screen bg-zinc-950 text-white">
-        <div className="text-center">
-          <div className="w-12 h-12 border-4 border-blue-500 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
-          <p className="text-zinc-500 font-mono text-xs uppercase tracking-widest">Загрузка модулей...</p>
-        </div>
-      </div>
-    );
-  }
+  // Экономика
+  useEffect(() => {
+    if (!isConnected || gameOver) return;
+    const interval = setInterval(() => {
+      setState(prev => ({
+        ...prev,
+        gold: {
+          [Color.WHITE]: prev.gold[Color.WHITE] + 0.25,
+          [Color.BLACK]: prev.gold[Color.BLACK] + 0.25,
+        }
+      }));
+    }, 8000);
+    return () => clearInterval(interval);
+  }, [isConnected, gameOver]);
 
-  if (!myColor) {
-    return (
-      <div className="flex items-center justify-center h-screen bg-zinc-950 p-6">
-        <div className="bg-zinc-900 p-8 rounded-2xl border border-zinc-800 shadow-2xl max-w-md w-full text-center">
-          <h1 className="text-3xl font-black text-white mb-2 tracking-tighter italic">Chaotic Chess</h1>
-          <p className="text-zinc-500 mb-8 text-[10px] uppercase font-bold tracking-[0.2em]">P2P Battle Engine</p>
-          
-          <div className="space-y-6">
-            <div className={`bg-zinc-800 p-5 rounded-xl border transition-all ${peerError ? 'border-red-900/50 bg-red-950/20' : 'border-zinc-700'}`}>
-              <p className="text-[10px] font-bold text-zinc-500 uppercase mb-3">Ваш код:</p>
-              <div className="flex items-center gap-3">
-                <p className="flex-grow font-mono text-sm text-left text-yellow-500 font-bold">
-                  {peerError ? peerError : (myPeerId || 'Генерация...')}
-                </p>
-                {myPeerId && (
-                  <button onClick={() => {navigator.clipboard.writeText(myPeerId); setLog(["Код скопирован!", ...log])}} className="bg-zinc-700 hover:bg-zinc-600 p-2 rounded-lg text-xs transition-colors">📋</button>
-                )}
-              </div>
-            </div>
+  const syncState = (newState: BoardState, message?: string) => {
+    if (connection?.open) {
+      connection.send({
+        type: 'STATE_UPDATE',
+        state: { ...newState, cells: Array.from(newState.cells) },
+        log: message
+      });
+    }
+  };
 
-            <div className="flex flex-col gap-3">
-              <input 
-                type="text" 
-                value={remotePeerId} 
-                onChange={(e) => setRemotePeerId(e.target.value.toUpperCase())}
-                className="bg-zinc-800 border border-zinc-700 p-4 rounded-xl text-white font-mono text-sm focus:ring-2 ring-blue-500 outline-none w-full text-center"
-                placeholder="КОД ДРУГА"
-              />
-              <button 
-                onClick={connectToPeer}
-                disabled={!myPeerId}
-                className="bg-blue-600 hover:bg-blue-500 disabled:bg-zinc-800 disabled:text-zinc-600 text-white font-black py-4 rounded-xl transition-all shadow-lg active:scale-95 text-sm uppercase tracking-widest"
-              >
-                Начать битву
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // Рендер игрового поля (оставлен без изменений для краткости, так как проблема была в инициализации)
   const boardBounds = useMemo(() => {
     const coords = Array.from(state.cells).map(keyToPos);
+    if (coords.length === 0) return { minX: 0, maxX: 0, minY: 0, maxY: 0, width: 1, height: 1 };
     const minX = Math.min(...coords.map(c => c.x));
     const maxX = Math.max(...coords.map(c => c.x));
     const minY = Math.min(...coords.map(c => c.y));
@@ -212,62 +178,191 @@ export default function App() {
     return { minX, maxX, minY, maxY, width: maxX - minX + 1, height: maxY - minY + 1 };
   }, [state.cells]);
 
-  const handleCellClick = (pos: Position) => {
-    if (gameOver || state.turn !== myColor) return;
-    // ... логика ходов из предыдущей версии
-    const piece = state.pieces.find(p => !p.isGhost && p.pos.x === pos.x && p.pos.y === pos.y);
-    if (selected) {
-       if (validMoves.some(m => m.x === pos.x && m.y === pos.y)) {
-           // Здесь должна быть функция executeMove, для краткости опустим, 
-           // так как мы фиксим только белый экран.
-       }
+  const executeMove = (from: Position, to: Position) => {
+    const activePiece = state.pieces.find(p => p.pos.x === from.x && p.pos.y === from.y)!;
+    const targetPiece = state.pieces.find(p => p.pos.x === to.x && p.pos.y === to.y);
+
+    let nextPieces = state.pieces
+      .filter(p => !(p.pos.x === to.x && p.pos.y === to.y))
+      .map(p => (p.pos.x === from.x && p.pos.y === from.y) ? { ...p, pos: to, hasMoved: true } : p);
+
+    const nextTurn = state.turn === Color.WHITE ? Color.BLACK : Color.WHITE;
+    let newState: BoardState = {
+      ...state,
+      pieces: nextPieces,
+      turn: nextTurn,
+      lastMove: { from, to, piece: activePiece, captured: targetPiece }
+    };
+
+    if (Math.random() < 0.1) {
+      const { newCells } = ChessEngine.expandBoard(state.cells);
+      newState.cells = newCells;
     }
+
+    if (targetPiece?.type === PieceType.KING) {
+      const winMsg = `${myColor === Color.WHITE ? "БЕЛЫЕ" : "ЧЕРНЫЕ"} ВЗЯЛИ КОРОЛЯ!`;
+      setGameOver(winMsg);
+      connection?.send({ type: 'GAME_OVER', message: winMsg });
+    }
+
+    setState(newState);
+    syncState(newState);
+    setSelected(null);
+    setValidMoves([]);
+  };
+
+  const handleCellClick = (pos: Position) => {
+    if (gameOver || state.turn !== myColor || !isConnected) return;
+
+    if (shopActive) {
+      const cost = PIECE_COSTS[shopActive];
+      if (state.gold[myColor] >= cost) {
+        const newPiece: Piece = {
+          id: `buy-${Date.now()}`,
+          type: shopActive,
+          color: myColor,
+          pos,
+          hasMoved: false
+        };
+        const newState = {
+          ...state,
+          pieces: [...state.pieces, newPiece],
+          gold: { ...state.gold, [myColor]: state.gold[myColor] - cost }
+        };
+        setState(newState);
+        syncState(newState, `Куплен ${shopActive}`);
+        setShopActive(null);
+      }
+      return;
+    }
+
+    const piece = state.pieces.find(p => p.pos.x === pos.x && p.pos.y === pos.y);
+    if (selected) {
+      if (validMoves.some(m => m.x === pos.x && m.y === pos.y)) {
+        executeMove(selected, pos);
+        return;
+      }
+    }
+
     if (piece && piece.color === myColor) {
       setSelected(pos);
       setValidMoves(ChessEngine.getValidMoves(state, pos));
+    } else {
+      setSelected(null);
+      setValidMoves([]);
     }
   };
 
+  if (!isPeerLibReady) return <div className="h-screen bg-zinc-950 flex items-center justify-center text-zinc-500 font-mono">ЗАГРУЗКА ПЛАТФОРМЫ...</div>;
+
+  if (!myColor) {
+    return (
+      <div className="flex items-center justify-center h-screen bg-zinc-950 p-6">
+        <div className="bg-zinc-900 p-8 rounded-2xl border border-zinc-800 shadow-2xl max-w-md w-full text-center">
+          <h1 className="text-3xl font-black text-white mb-6 italic tracking-tighter">Chaotic Chess</h1>
+          <div className="space-y-4">
+            <div className="bg-zinc-800 p-4 rounded-xl border border-zinc-700">
+              <p className="text-[10px] font-bold text-zinc-500 uppercase mb-2">Ваш Код:</p>
+              <p className="text-xl font-mono text-yellow-500 font-bold">{peerError || myPeerId || '...'}</p>
+            </div>
+            <input 
+              type="text" 
+              placeholder="КОД ДРУГА"
+              value={remotePeerId}
+              onChange={(e) => setRemotePeerId(e.target.value.toUpperCase())}
+              className="w-full bg-zinc-800 border border-zinc-700 p-4 rounded-xl text-white font-mono text-center focus:ring-2 ring-blue-500 outline-none"
+            />
+            <button onClick={connectToPeer} className="w-full bg-blue-600 hover:bg-blue-500 text-white font-black py-4 rounded-xl transition-all">ИГРАТЬ ПО СЕТИ</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="flex flex-col md:flex-row h-screen p-4 gap-4 overflow-hidden select-none bg-zinc-950 text-white">
-       <div className="flex-grow bg-zinc-900 rounded-2xl border border-zinc-800 relative flex items-center justify-center overflow-auto">
-          <div 
-            className="grid gap-px bg-zinc-800 p-px"
-            style={{
-              gridTemplateColumns: `repeat(${boardBounds.width}, 50px)`,
-              gridTemplateRows: `repeat(${boardBounds.height}, 50px)`,
-            }}
-          >
-            {Array.from({ length: boardBounds.height }).map((_, r) => {
-              const y = boardBounds.minY + r;
-              return Array.from({ length: boardBounds.width }).map((_, c) => {
-                const x = boardBounds.minX + c;
-                const key = posToKey({x,y});
-                const exists = state.cells.has(key);
-                const piece = state.pieces.find(p => p.pos.x === x && p.pos.y === y);
-                if (!exists) return <div key={key} className="w-[50px] h-[50px] bg-zinc-950/20" />;
-                return (
-                  <div 
-                    key={key} 
-                    onClick={() => handleCellClick({x,y})}
-                    className={`w-[50px] h-[50px] flex items-center justify-center text-2xl cursor-pointer ${(x+y)%2===0 ? 'bg-zinc-300' : 'bg-zinc-700/80'}`}
-                  >
-                    {piece && <span className={piece.color === Color.WHITE ? 'text-white' : 'text-black'}>{PIECE_ICONS[piece.type][piece.color]}</span>}
-                  </div>
-                )
-              })
-            })}
+    <div className="flex flex-col md:flex-row h-screen p-4 gap-4 bg-zinc-950 text-white overflow-hidden">
+      <div className="flex-grow bg-zinc-900 rounded-2xl border border-zinc-800 relative flex items-center justify-center overflow-auto custom-scrollbar">
+        <div 
+          className="grid gap-px bg-zinc-800 p-px shadow-2xl"
+          style={{
+            gridTemplateColumns: `repeat(${boardBounds.width}, 50px)`,
+            gridTemplateRows: `repeat(${boardBounds.height}, 50px)`,
+          }}
+        >
+          {Array.from({ length: boardBounds.height }).map((_, r) => {
+            const y = boardBounds.minY + r;
+            return Array.from({ length: boardBounds.width }).map((_, c) => {
+              const x = boardBounds.minX + c;
+              const key = posToKey({x,y});
+              const exists = state.cells.has(key);
+              const piece = state.pieces.find(p => p.pos.x === x && p.pos.y === y);
+              const isSelected = selected?.x === x && selected?.y === y;
+              const isValid = validMoves.some(m => m.x === x && m.y === y);
+
+              if (!exists) return <div key={key} className="w-[50px] h-[50px] bg-zinc-950/20" />;
+
+              return (
+                <div 
+                  key={key}
+                  onClick={() => handleCellClick({x,y})}
+                  className={`
+                    w-[50px] h-[50px] flex items-center justify-center text-3xl cursor-pointer transition-colors
+                    ${(x+y)%2 === 0 ? 'bg-zinc-200' : 'bg-zinc-700'}
+                    ${isSelected ? 'ring-4 ring-yellow-400 z-10' : ''}
+                    ${isValid ? 'bg-green-500/50' : ''}
+                  `}
+                >
+                  {piece && <span className={piece.color === Color.WHITE ? 'text-white drop-shadow-md' : 'text-zinc-900'}>{PIECE_ICONS[piece.type][piece.color]}</span>}
+                </div>
+              );
+            });
+          })}
+        </div>
+
+        {gameOver && (
+          <div className="absolute inset-0 bg-black/80 backdrop-blur-md flex flex-col items-center justify-center z-50">
+            <h2 className="text-5xl font-black text-yellow-500 mb-4 italic">КОНЕЦ ИГРЫ</h2>
+            <p className="text-white mb-8 font-bold">{gameOver}</p>
+            <button onClick={() => window.location.reload()} className="bg-white text-black px-8 py-3 rounded-full font-bold">НОВАЯ ИГРА</button>
           </div>
-       </div>
-       <div className="w-80 bg-zinc-900 border border-zinc-800 rounded-2xl p-4 flex flex-col gap-4">
-          <div className="text-center p-4 bg-zinc-800 rounded-xl">
-            <p className="text-[10px] text-zinc-500 uppercase font-bold">Вы играете за</p>
-            <p className="text-xl font-black">{myColor === Color.WHITE ? 'БЕЛЫХ' : 'ЧЕРНЫХ'}</p>
+        )}
+      </div>
+
+      <div className="w-full md:w-80 flex flex-col gap-4">
+        <div className="bg-zinc-900 p-4 rounded-2xl border border-zinc-800">
+          <div className="flex justify-between items-center mb-4">
+            <span className="text-[10px] font-bold text-zinc-500 uppercase">Статус</span>
+            <div className={`w-2 h-2 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500 animate-pulse'}`}></div>
           </div>
-          <div className="flex-grow overflow-y-auto font-mono text-[10px] text-zinc-500 space-y-1">
-             {log.map((l, i) => <div key={i} className="p-2 bg-zinc-950/50 rounded">{l}</div>)}
-          </div>
-       </div>
+          <p className="text-xl font-black">{myColor === Color.WHITE ? 'БЕЛЫЕ' : 'ЧЕРНЫХ'}</p>
+          <p className={`text-xs mt-1 ${state.turn === myColor ? 'text-green-500 font-bold' : 'text-zinc-500'}`}>
+            {state.turn === myColor ? 'Ваш ход' : 'Ход противника'}
+          </p>
+        </div>
+
+        <div className="bg-zinc-900 p-4 rounded-2xl border border-zinc-800">
+          <p className="text-[10px] font-bold text-zinc-500 uppercase mb-2">Золото</p>
+          <p className="text-3xl font-mono text-yellow-500 font-black">{state.gold[myColor!].toFixed(1)}</p>
+        </div>
+
+        <div className="bg-zinc-900 p-4 rounded-2xl border border-zinc-800 grid grid-cols-2 gap-2">
+          {Object.entries(PIECE_COSTS).filter(([t]) => t !== 'king').map(([type, cost]) => (
+            <button 
+              key={type}
+              onClick={() => setShopActive(shopActive === type ? null : type as PieceType)}
+              disabled={state.gold[myColor!] < cost}
+              className={`p-2 rounded-xl border text-xs flex flex-col items-center gap-1 transition-all ${shopActive === type ? 'bg-blue-600 border-blue-400' : 'bg-zinc-800 border-zinc-700'}`}
+            >
+              <span className="text-xl">{PIECE_ICONS[type as PieceType][myColor!]}</span>
+              <span className="font-bold text-yellow-500">{cost}</span>
+            </button>
+          ))}
+        </div>
+
+        <div className="flex-grow bg-zinc-900 p-4 rounded-2xl border border-zinc-800 overflow-y-auto font-mono text-[10px] text-zinc-500 space-y-1">
+          {log.map((l, i) => <div key={i} className="p-2 bg-zinc-950/50 rounded">{l}</div>)}
+        </div>
+      </div>
     </div>
   );
 }
