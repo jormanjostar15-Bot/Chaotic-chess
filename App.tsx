@@ -45,7 +45,6 @@ export default function App() {
   const [connection, setConnection] = useState<any>(null);
   const [myColor, setMyColor] = useState<Color | null>(null);
   const [peerError, setPeerError] = useState<string | null>(null);
-  const [isInitializing, setIsInitializing] = useState(false);
   const peerRef = useRef<any>(null);
 
   const initPeer = () => {
@@ -53,52 +52,54 @@ export default function App() {
         peerRef.current.destroy();
     }
     
-    setIsInitializing(true);
     setPeerError(null);
+    setMyPeerId('');
 
     try {
-      // Использование защищенного соединения для работы на HTTPS хостингах типа Netlify
+      // Конфигурация специально для GitHub Pages и Netlify (HTTPS)
       const peer = new Peer(undefined, {
         host: '0.peerjs.com',
         port: 443,
         secure: true,
-        debug: 3
+        debug: 1, // Минимум логов для скорости
+        config: {
+          'iceServers': [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' }
+          ]
+        }
       });
       
       peerRef.current = peer;
 
       peer.on('open', (id: string) => {
         setMyPeerId(id);
-        setIsInitializing(false);
       });
 
       peer.on('connection', (conn: any) => {
         setConnection(conn);
         setMyColor(Color.WHITE);
-        setLog(prev => ["Противник подключился! Вы Белые.", ...prev]);
+        setLog(prev => ["Друг подключился! Вы играете за БЕЛЫХ.", ...prev]);
         setupConnection(conn);
       });
 
       peer.on('error', (err: any) => {
-        console.error('Peer error:', err.type, err);
-        setIsInitializing(false);
-        if (err.type === 'network') {
-          setPeerError('Ошибка сети (сервер недоступен)');
-        } else if (err.type === 'browser-incompatible') {
-          setPeerError('Браузер не поддерживает WebRTC');
+        console.error('Peer error type:', err.type);
+        if (err.type === 'network' || err.type === 'server-error') {
+          setPeerError('Ошибка сети. Попробуйте обновить 🔄');
+        } else if (err.type === 'peer-unavailable') {
+          setPeerError('ID друга не найден. Проверьте адрес.');
         } else {
-          setPeerError(`Ошибка: ${err.type}`);
+          setPeerError(`Сбой: ${err.type}`);
         }
       });
 
       peer.on('disconnected', () => {
-        console.log('Disconnected from signaling server. Reconnecting...');
         peer.reconnect();
       });
 
     } catch (e) {
-      setPeerError('Ошибка инициализации');
-      setIsInitializing(false);
+      setPeerError('Ошибка запуска P2P');
     }
   };
 
@@ -110,10 +111,6 @@ export default function App() {
   }, []);
 
   const setupConnection = (conn: any) => {
-    conn.on('open', () => {
-      setLog(prev => ["Соединение установлено!", ...prev]);
-    });
-    
     conn.on('data', (data: any) => {
       if (data.type === 'STATE_UPDATE') {
         const receivedState = data.state;
@@ -125,26 +122,26 @@ export default function App() {
     });
 
     conn.on('close', () => {
-        setLog(prev => ["Соединение разорвано!", ...prev]);
+        setLog(prev => ["Связь с противником потеряна.", ...prev]);
         setConnection(null);
     });
   };
 
   const connectToPeer = () => {
     if (!remotePeerId || !peerRef.current) return;
-    const conn = peerRef.current.connect(remotePeerId, {
+    const conn = peerRef.current.connect(remotePeerId.trim(), {
         reliable: true
     });
     setConnection(conn);
     setMyColor(Color.BLACK);
-    setLog(prev => ["Подключение к другу...", ...prev]);
+    setLog(prev => ["Подключаемся к другу... Пожалуйста, подождите.", ...prev]);
     setupConnection(conn);
   };
 
   const copyId = () => {
     if (!myPeerId) return;
     navigator.clipboard.writeText(myPeerId);
-    setLog(prev => ["ID скопирован!", ...prev]);
+    setLog(prev => ["Ваш ID скопирован!", ...prev]);
   };
 
   // Экономика
@@ -293,51 +290,49 @@ export default function App() {
 
   if (!myColor) {
     return (
-      <div className="flex items-center justify-center h-screen bg-zinc-950 p-6 overflow-y-auto">
+      <div className="flex items-center justify-center h-screen bg-zinc-950 p-6">
         <div className="bg-zinc-900 p-8 rounded-2xl border border-zinc-800 shadow-2xl max-w-md w-full text-center">
           <h1 className="text-3xl font-black text-white mb-2 tracking-tighter italic">Chaotic Chess</h1>
-          <p className="text-zinc-500 mb-8 text-[10px] uppercase font-bold tracking-[0.2em]">P2P Online Battle</p>
+          <p className="text-zinc-500 mb-8 text-[10px] uppercase font-bold tracking-[0.2em]">P2P Battle on GitHub Pages</p>
           
           <div className="space-y-6">
-            <div className={`bg-zinc-800 p-5 rounded-xl border transition-all ${peerError ? 'border-red-900/50 bg-red-900/5' : 'border-zinc-700'}`}>
-              <p className="text-[10px] font-bold text-zinc-500 uppercase mb-3">Ваш сетевой адрес:</p>
+            <div className={`bg-zinc-800 p-5 rounded-xl border transition-all ${peerError ? 'border-red-900/50' : 'border-zinc-700'}`}>
+              <p className="text-[10px] font-bold text-zinc-500 uppercase mb-3">Ваш секретный код:</p>
               <div className="flex items-center gap-3">
                 <p className={`flex-grow font-mono text-sm text-left break-all ${peerError ? 'text-red-400' : 'text-yellow-500'}`}>
-                  {peerError ? peerError : (myPeerId || 'Установка соединения...')}
+                  {peerError ? peerError : (myPeerId || 'Создание комнаты...')}
                 </p>
                 {myPeerId && !peerError && (
-                  <button onClick={copyId} className="bg-zinc-700 hover:bg-zinc-600 p-2 rounded-lg text-xs transition-colors" title="Копировать ID">📋</button>
+                  <button onClick={copyId} className="bg-zinc-700 hover:bg-zinc-600 p-2 rounded-lg text-xs transition-colors">📋</button>
                 )}
                 {peerError && (
-                  <button onClick={initPeer} className="bg-red-600 hover:bg-red-500 p-2 rounded-lg text-xs text-white" title="Повторить">🔄</button>
+                  <button onClick={initPeer} className="bg-red-600 hover:bg-red-500 p-2 rounded-lg text-xs text-white">🔄</button>
                 )}
               </div>
             </div>
 
             <div className="flex flex-col gap-3">
-              <p className="text-[10px] font-bold text-zinc-500 uppercase text-left">Вставьте адрес друга:</p>
+              <p className="text-[10px] font-bold text-zinc-500 uppercase text-left">Вставьте код друга:</p>
               <input 
                 type="text" 
                 value={remotePeerId} 
                 onChange={(e) => setRemotePeerId(e.target.value)}
-                className="bg-zinc-800 border border-zinc-700 p-4 rounded-xl text-white font-mono text-sm focus:ring-2 ring-blue-500 outline-none w-full placeholder:text-zinc-600"
-                placeholder="Адрес друга..."
+                className="bg-zinc-800 border border-zinc-700 p-4 rounded-xl text-white font-mono text-sm focus:ring-2 ring-blue-500 outline-none w-full"
+                placeholder="Код от друга..."
               />
               <button 
                 onClick={connectToPeer}
                 disabled={!myPeerId || !!peerError}
                 className="bg-blue-600 hover:bg-blue-500 disabled:bg-zinc-800 disabled:text-zinc-600 text-white font-black py-4 rounded-xl transition-all shadow-lg active:scale-95 text-sm uppercase tracking-widest"
               >
-                Найти противника
+                Начать битву
               </button>
             </div>
             
             <div className="p-4 bg-zinc-800/30 rounded-xl text-left border border-zinc-800/50">
-              <ul className="text-[10px] text-zinc-500 space-y-2 list-disc list-inside">
-                <li>Игра работает напрямую через ваш браузер.</li>
-                <li>Создатель комнаты играет за Белых.</li>
-                <li>Если пишет "Ошибка сети", нажмите 🔄 или обновите страницу.</li>
-              </ul>
+              <p className="text-[10px] text-zinc-500 leading-relaxed">
+                <strong className="text-zinc-400">Совет:</strong> Если игра не находит друга, убедитесь, что вы оба используете <code className="text-blue-400">https://</code> в начале адреса страницы.
+              </p>
             </div>
           </div>
         </div>
