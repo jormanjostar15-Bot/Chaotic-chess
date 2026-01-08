@@ -1,0 +1,5 @@
+{
+  "name": "Chaotic Chess",
+  "description": "A unique chess game where the board expands dynamically and randomly as you play, featuring full chess rules adapted for an infinite growing grid.",
+  "requestFramePermissions": []
+}
