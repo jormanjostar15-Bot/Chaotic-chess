@@ -1,38 +1,25 @@
 
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { Color, PieceType, Position, Piece, BoardState, Move, PIECE_COSTS } from './types';
 import { ChessEngine, posToKey, keyToPos } from './logic/chessLogic';
+
+declare const Peer: any;
 
 const INITIAL_SIZE = 8;
 const createInitialState = (): BoardState => {
   const cells = new Set<string>();
   const pieces: Piece[] = [];
-
   for (let y = 0; y < INITIAL_SIZE; y++) {
-    for (let x = 0; x < INITIAL_SIZE; x++) {
-      cells.add(`${x},${y}`);
-    }
+    for (let x = 0; x < INITIAL_SIZE; x++) cells.add(`${x},${y}`);
   }
-
-  const pieceOrder = [
-    PieceType.ROOK, PieceType.KNIGHT, PieceType.BISHOP, PieceType.QUEEN,
-    PieceType.KING, PieceType.BISHOP, PieceType.KNIGHT, PieceType.ROOK
-  ];
-
+  const pieceOrder = [PieceType.ROOK, PieceType.KNIGHT, PieceType.BISHOP, PieceType.QUEEN, PieceType.KING, PieceType.BISHOP, PieceType.KNIGHT, PieceType.ROOK];
   for (let x = 0; x < 8; x++) {
     pieces.push({ id: `w-p-${x}`, type: PieceType.PAWN, color: Color.WHITE, pos: { x, y: 6 }, hasMoved: false });
     pieces.push({ id: `b-p-${x}`, type: PieceType.PAWN, color: Color.BLACK, pos: { x, y: 1 }, hasMoved: false });
     pieces.push({ id: `w-m-${x}`, type: pieceOrder[x], color: Color.WHITE, pos: { x, y: 7 }, hasMoved: false });
     pieces.push({ id: `b-m-${x}`, type: pieceOrder[x], color: Color.BLACK, pos: { x, y: 0 }, hasMoved: false });
   }
-
-  return { 
-    cells, 
-    pieces, 
-    turn: Color.WHITE, 
-    lastMove: null,
-    gold: { [Color.WHITE]: 0, [Color.BLACK]: 0 }
-  };
+  return { cells, pieces, turn: Color.WHITE, lastMove: null, gold: { [Color.WHITE]: 0, [Color.BLACK]: 0 } };
 };
 
 const PIECE_ICONS: Record<PieceType, Record<Color, string>> = {
@@ -48,11 +35,119 @@ export default function App() {
   const [state, setState] = useState<BoardState>(createInitialState());
   const [selected, setSelected] = useState<Position | null>(null);
   const [validMoves, setValidMoves] = useState<Position[]>([]);
-  const [log, setLog] = useState<string[]>(["Игра началась!"]);
+  const [log, setLog] = useState<string[]>(["Добро пожаловать!"]);
   const [gameOver, setGameOver] = useState<string | null>(null);
   const [shopActive, setShopActive] = useState<PieceType | null>(null);
 
-  // Экономика: +0.25 монет каждые 8 секунд обоим игрокам
+  // Сетевые состояния
+  const [myPeerId, setMyPeerId] = useState<string>('');
+  const [remotePeerId, setRemotePeerId] = useState<string>('');
+  const [connection, setConnection] = useState<any>(null);
+  const [myColor, setMyColor] = useState<Color | null>(null);
+  const [peerError, setPeerError] = useState<string | null>(null);
+  const [isInitializing, setIsInitializing] = useState(false);
+  const peerRef = useRef<any>(null);
+
+  const initPeer = () => {
+    if (peerRef.current) {
+        peerRef.current.destroy();
+    }
+    
+    setIsInitializing(true);
+    setPeerError(null);
+
+    try {
+      // Использование защищенного соединения для работы на HTTPS хостингах типа Netlify
+      const peer = new Peer(undefined, {
+        host: '0.peerjs.com',
+        port: 443,
+        secure: true,
+        debug: 3
+      });
+      
+      peerRef.current = peer;
+
+      peer.on('open', (id: string) => {
+        setMyPeerId(id);
+        setIsInitializing(false);
+      });
+
+      peer.on('connection', (conn: any) => {
+        setConnection(conn);
+        setMyColor(Color.WHITE);
+        setLog(prev => ["Противник подключился! Вы Белые.", ...prev]);
+        setupConnection(conn);
+      });
+
+      peer.on('error', (err: any) => {
+        console.error('Peer error:', err.type, err);
+        setIsInitializing(false);
+        if (err.type === 'network') {
+          setPeerError('Ошибка сети (сервер недоступен)');
+        } else if (err.type === 'browser-incompatible') {
+          setPeerError('Браузер не поддерживает WebRTC');
+        } else {
+          setPeerError(`Ошибка: ${err.type}`);
+        }
+      });
+
+      peer.on('disconnected', () => {
+        console.log('Disconnected from signaling server. Reconnecting...');
+        peer.reconnect();
+      });
+
+    } catch (e) {
+      setPeerError('Ошибка инициализации');
+      setIsInitializing(false);
+    }
+  };
+
+  useEffect(() => {
+    initPeer();
+    return () => {
+      if (peerRef.current) peerRef.current.destroy();
+    };
+  }, []);
+
+  const setupConnection = (conn: any) => {
+    conn.on('open', () => {
+      setLog(prev => ["Соединение установлено!", ...prev]);
+    });
+    
+    conn.on('data', (data: any) => {
+      if (data.type === 'STATE_UPDATE') {
+        const receivedState = data.state;
+        receivedState.cells = new Set(data.state.cells);
+        setState(receivedState);
+        if (data.log) setLog(prev => [data.log, ...prev.slice(0, 10)]);
+      }
+      if (data.type === 'GAME_OVER') setGameOver(data.message);
+    });
+
+    conn.on('close', () => {
+        setLog(prev => ["Соединение разорвано!", ...prev]);
+        setConnection(null);
+    });
+  };
+
+  const connectToPeer = () => {
+    if (!remotePeerId || !peerRef.current) return;
+    const conn = peerRef.current.connect(remotePeerId, {
+        reliable: true
+    });
+    setConnection(conn);
+    setMyColor(Color.BLACK);
+    setLog(prev => ["Подключение к другу...", ...prev]);
+    setupConnection(conn);
+  };
+
+  const copyId = () => {
+    if (!myPeerId) return;
+    navigator.clipboard.writeText(myPeerId);
+    setLog(prev => ["ID скопирован!", ...prev]);
+  };
+
+  // Экономика
   useEffect(() => {
     const interval = setInterval(() => {
       setState(prev => ({
@@ -66,8 +161,19 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
+  const syncState = (newState: BoardState, message?: string) => {
+    if (connection && connection.open) {
+      connection.send({
+        type: 'STATE_UPDATE',
+        state: { ...newState, cells: Array.from(newState.cells) },
+        log: message
+      });
+    }
+  };
+
   const boardBounds = useMemo(() => {
     const coords = Array.from(state.cells).map(keyToPos);
+    if (coords.length === 0) return { minX: 0, maxX: 0, minY: 0, maxY: 0, width: 1, height: 1 };
     const minX = Math.min(...coords.map(c => c.x));
     const maxX = Math.max(...coords.map(c => c.x));
     const minY = Math.min(...coords.map(c => c.y));
@@ -76,58 +182,46 @@ export default function App() {
   }, [state.cells]);
 
   const canPlaceAt = (pos: Position, color: Color) => {
-    // Белые ставят не выше 6-й линии (y >= 6 или y <= 7? В шахматах 6-я линия это y=2, но тут 0 вверху)
-    // Ориентируемся на визуальные координаты: Белые (снизу) стартуют на y=6,7. 
-    // "Не выше 6 линии" для белых обычно означает зону их половины.
-    // Условие: Белые (белые клетки снизу): y >= 3. Черные (сверху): y <= 4. 
-    // Исходя из вашего запроса: Белые не выше 6-й линии (в шахматной нотации), в координатах массива это y >= 2.
-    // Черные не ниже 3-й (в нотации), в координатах это y <= 5.
     if (color === Color.WHITE) return pos.y >= 2;
     return pos.y <= 5;
   };
 
   const handleCellClick = (pos: Position) => {
     if (gameOver) return;
+    const isMyTurn = state.turn === myColor;
 
-    // Режим установки купленной фигуры
     if (shopActive) {
       if (!state.cells.has(posToKey(pos))) return;
-      
-      // Проверка: нет ли уже прообраза ЭТОГО игрока на поле
-      const hasMyGhost = state.pieces.some(p => p.isGhost && p.color === state.turn);
-      if (hasMyGhost) {
-        setLog(prev => [`У вас уже есть один прообраз в процессе материализации!`, ...prev.slice(0, 5)]);
-        setShopActive(null);
-        return;
-      }
-
-      if (!canPlaceAt(pos, state.turn)) {
-        setLog(prev => ["Недопустимая линия для установки!", ...prev.slice(0, 5)]);
-        return;
-      }
+      const hasMyGhost = state.pieces.some(p => p.isGhost && p.color === myColor);
+      if (hasMyGhost) return;
+      if (!canPlaceAt(pos, myColor!)) return;
 
       const cost = PIECE_COSTS[shopActive];
-      if (state.gold[state.turn] >= cost) {
+      if (state.gold[myColor!] >= cost) {
         const newGhost: Piece = {
           id: `ghost-${Date.now()}`,
           type: shopActive,
-          color: state.turn,
+          color: myColor!,
           pos,
           hasMoved: false,
           isGhost: true,
           materializeIn: 3
         };
-        
-        setState(prev => ({
-          ...prev,
-          pieces: [...prev.pieces, newGhost],
-          gold: { ...prev.gold, [prev.turn]: prev.gold[prev.turn] - cost }
-        }));
-        setLog(prev => [`Установлен прообраз ${shopActive}. Появится через 3 хода.`, ...prev.slice(0, 10)]);
+        const newState = {
+          ...state,
+          pieces: [...state.pieces, newGhost],
+          gold: { ...state.gold, [myColor!]: state.gold[myColor!] - cost }
+        };
+        const msg = `Прообраз ${shopActive} установлен!`;
+        setState(newState);
+        syncState(newState, msg);
+        setLog(prev => [msg, ...prev.slice(0, 10)]);
         setShopActive(null);
       }
       return;
     }
+
+    if (!isMyTurn) return;
 
     if (selected) {
       const isMove = validMoves.some(m => m.x === pos.x && m.y === pos.y);
@@ -139,8 +233,7 @@ export default function App() {
 
     const realPiecesOnly = state.pieces.filter(p => !p.isGhost);
     const piece = realPiecesOnly.find(p => p.pos.x === pos.x && p.pos.y === pos.y);
-    
-    if (piece && piece.color === state.turn) {
+    if (piece && piece.color === myColor) {
       setSelected(pos);
       setValidMoves(ChessEngine.getValidMoves({ ...state, pieces: realPiecesOnly }, pos));
     } else {
@@ -153,54 +246,30 @@ export default function App() {
     let currentPieces = [...state.pieces];
     const realPieces = currentPieces.filter(p => !p.isGhost);
     const ghostPieces = currentPieces.filter(p => p.isGhost);
-
     const activePiece = realPieces.find(p => p.pos.x === from.x && p.pos.y === from.y)!;
     const targetPiece = realPieces.find(p => p.pos.x === to.x && p.pos.y === to.y);
 
-    // 1. Обычный ход
     let nextRealPieces = realPieces
       .filter(p => !(p.pos.x === to.x && p.pos.y === to.y))
       .map(p => (p.pos.x === from.x && p.pos.y === from.y) ? { ...p, pos: to, hasMoved: true } : p);
 
-    // Спец. правила хода
-    if (activePiece.type === PieceType.PAWN && from.x !== to.x && !targetPiece) {
-        nextRealPieces = nextRealPieces.filter(p => !(p.pos.x === to.x && p.pos.y === from.y));
-    }
-    if (activePiece.type === PieceType.KING && Math.abs(from.x - to.x) === 2) {
-        const dx = to.x > from.x ? 1 : -1;
-        const rook = realPieces.find(p => p.type === PieceType.ROOK && p.color === activePiece.color && !p.hasMoved && (dx === 1 ? p.pos.x > from.x : p.pos.x < from.x));
-        if (rook) nextRealPieces = nextRealPieces.map(p => p.id === rook.id ? { ...p, pos: { x: to.x - dx, y: to.y }, hasMoved: true } : p);
-    }
-    const verticalCells = Array.from(state.cells).map(keyToPos).filter(c => c.x === to.x);
-    const extremeY = activePiece.color === Color.WHITE ? Math.min(...verticalCells.map(c => c.y)) : Math.max(...verticalCells.map(c => c.y));
-    if (activePiece.type === PieceType.PAWN && to.y === extremeY) {
-        nextRealPieces = nextRealPieces.map(p => (p.pos.x === to.x && p.pos.y === to.y) ? { ...p, type: PieceType.QUEEN } : p);
-    }
-
-    // 2. Обработка прообразов (Ghost materialization)
-    let finalPieces: Piece[] = [];
-    let gameEndedByGhost = false;
-
     const nextGhosts = ghostPieces.map(g => ({ ...g, materializeIn: (g.materializeIn || 1) - 1 }));
-    
-    // Оставляем те, что еще не проявились
+    let finalPieces: Piece[] = [];
+    let tempRealPieces = [...nextRealPieces];
+
+    const becomingReal = nextGhosts.filter(g => g.materializeIn <= 0);
     finalPieces.push(...nextGhosts.filter(g => g.materializeIn > 0));
 
-    // Проявляем те, у кого счетчик 0
-    const becomingReal = nextGhosts.filter(g => g.materializeIn <= 0);
-    
-    let tempRealPieces = [...nextRealPieces];
     becomingReal.forEach(g => {
         const captured = tempRealPieces.find(p => p.pos.x === g.pos.x && p.pos.y === g.pos.y);
         if (captured?.type === PieceType.KING) {
-            setGameOver(`${g.color === Color.WHITE ? "БЕЛЫЕ" : "ЧЕРНЫЕ"} ПОБЕДИЛИ (Король съеден прообразом!)`);
-            gameEndedByGhost = true;
+            const msg = `${g.color === Color.WHITE ? "БЕЛЫЕ" : "ЧЕРНЫЕ"} ПОБЕДИЛИ!`;
+            setGameOver(msg);
+            if(connection) connection.send({ type: 'GAME_OVER', message: msg });
         }
-        // Удаляем любую фигуру на этой клетке
         tempRealPieces = tempRealPieces.filter(p => !(p.pos.x === g.pos.x && p.pos.y === g.pos.y));
         tempRealPieces.push({ ...g, isGhost: false, materializeIn: undefined });
     });
-
     finalPieces.push(...tempRealPieces);
 
     const nextTurn = state.turn === Color.WHITE ? Color.BLACK : Color.WHITE;
@@ -212,44 +281,80 @@ export default function App() {
     };
 
     if (Math.random() < 0.05) {
-        const { newCells, addedCount } = ChessEngine.expandBoard(state.cells);
+        const { newCells } = ChessEngine.expandBoard(state.cells);
         nextState.cells = newCells;
-        setLog(prev => [`Хаос! Клеток добавлено: ${addedCount}`, ...prev.slice(0, 10)]);
-    }
-
-    if (!gameEndedByGhost) {
-        const engineCheckState = { ...nextState, pieces: tempRealPieces };
-        if (ChessEngine.isCheckmate(engineCheckState, nextTurn)) {
-            setGameOver(`${state.turn === Color.WHITE ? "БЕЛЫЕ" : "ЧЕРНЫЕ"} ПОБЕДИЛИ!`);
-        } else if (ChessEngine.isStalemate(engineCheckState, nextTurn)) {
-            setGameOver(`НИЧЬЯ (Пат)!`);
-        }
     }
 
     setState(nextState);
+    syncState(nextState);
     setSelected(null);
     setValidMoves([]);
   };
 
-  const resetGame = () => {
-    setState(createInitialState());
-    setSelected(null);
-    setValidMoves([]);
-    setLog(["Игра сброшена."]);
-    setGameOver(null);
-    setShopActive(null);
-  };
+  if (!myColor) {
+    return (
+      <div className="flex items-center justify-center h-screen bg-zinc-950 p-6 overflow-y-auto">
+        <div className="bg-zinc-900 p-8 rounded-2xl border border-zinc-800 shadow-2xl max-w-md w-full text-center">
+          <h1 className="text-3xl font-black text-white mb-2 tracking-tighter italic">Chaotic Chess</h1>
+          <p className="text-zinc-500 mb-8 text-[10px] uppercase font-bold tracking-[0.2em]">P2P Online Battle</p>
+          
+          <div className="space-y-6">
+            <div className={`bg-zinc-800 p-5 rounded-xl border transition-all ${peerError ? 'border-red-900/50 bg-red-900/5' : 'border-zinc-700'}`}>
+              <p className="text-[10px] font-bold text-zinc-500 uppercase mb-3">Ваш сетевой адрес:</p>
+              <div className="flex items-center gap-3">
+                <p className={`flex-grow font-mono text-sm text-left break-all ${peerError ? 'text-red-400' : 'text-yellow-500'}`}>
+                  {peerError ? peerError : (myPeerId || 'Установка соединения...')}
+                </p>
+                {myPeerId && !peerError && (
+                  <button onClick={copyId} className="bg-zinc-700 hover:bg-zinc-600 p-2 rounded-lg text-xs transition-colors" title="Копировать ID">📋</button>
+                )}
+                {peerError && (
+                  <button onClick={initPeer} className="bg-red-600 hover:bg-red-500 p-2 rounded-lg text-xs text-white" title="Повторить">🔄</button>
+                )}
+              </div>
+            </div>
+
+            <div className="flex flex-col gap-3">
+              <p className="text-[10px] font-bold text-zinc-500 uppercase text-left">Вставьте адрес друга:</p>
+              <input 
+                type="text" 
+                value={remotePeerId} 
+                onChange={(e) => setRemotePeerId(e.target.value)}
+                className="bg-zinc-800 border border-zinc-700 p-4 rounded-xl text-white font-mono text-sm focus:ring-2 ring-blue-500 outline-none w-full placeholder:text-zinc-600"
+                placeholder="Адрес друга..."
+              />
+              <button 
+                onClick={connectToPeer}
+                disabled={!myPeerId || !!peerError}
+                className="bg-blue-600 hover:bg-blue-500 disabled:bg-zinc-800 disabled:text-zinc-600 text-white font-black py-4 rounded-xl transition-all shadow-lg active:scale-95 text-sm uppercase tracking-widest"
+              >
+                Найти противника
+              </button>
+            </div>
+            
+            <div className="p-4 bg-zinc-800/30 rounded-xl text-left border border-zinc-800/50">
+              <ul className="text-[10px] text-zinc-500 space-y-2 list-disc list-inside">
+                <li>Игра работает напрямую через ваш браузер.</li>
+                <li>Создатель комнаты играет за Белых.</li>
+                <li>Если пишет "Ошибка сети", нажмите 🔄 или обновите страницу.</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
-    <div className="flex flex-col md:flex-row h-screen p-4 gap-4 overflow-hidden select-none">
-      <div className={`flex-grow bg-zinc-900 rounded-xl border border-zinc-800 relative overflow-hidden flex items-center justify-center p-8 ${shopActive ? 'cursor-crosshair bg-blue-900/10' : ''}`}>
+    <div className="flex flex-col md:flex-row h-screen p-4 gap-4 overflow-hidden select-none bg-zinc-950">
+      <div className={`flex-grow bg-zinc-900 rounded-2xl border border-zinc-800 relative overflow-hidden flex items-center justify-center p-8 ${shopActive ? 'cursor-crosshair bg-blue-900/5' : ''}`}>
         <div 
-          className="grid gap-px bg-zinc-800 p-px shadow-2xl transition-all duration-500"
+          className="grid gap-px bg-zinc-800 p-px shadow-2xl transition-all duration-500 rounded-sm overflow-hidden"
           style={{
             gridTemplateColumns: `repeat(${boardBounds.width}, minmax(0, 1fr))`,
             gridTemplateRows: `repeat(${boardBounds.height}, minmax(0, 1fr))`,
             aspectRatio: `${boardBounds.width} / ${boardBounds.height}`,
-            maxHeight: '90%', maxWidth: '90%'
+            maxHeight: '95%', maxWidth: '95%'
           }}
         >
           {Array.from({ length: boardBounds.height }).map((_, rowIdx) => {
@@ -265,20 +370,20 @@ export default function App() {
                   const isSelected = selected?.x === x && selected?.y === y;
                   const isValid = validMoves.some(m => m.x === x && m.y === y);
                   const isDark = (x + y) % 2 !== 0;
-                  const canPlace = shopActive && canPlaceAt({x, y}, state.turn);
+                  const canPlace = shopActive && canPlaceAt({x, y}, myColor!);
 
-                  if (!exists) return <div key={key} className="bg-zinc-950/20" />;
+                  if (!exists) return <div key={key} className="bg-zinc-950/10" />;
 
                   return (
                     <div
                       key={key}
                       onClick={() => handleCellClick({ x, y })}
                       className={`
-                        relative cursor-pointer transition-colors duration-200 flex items-center justify-center text-3xl md:text-5xl
-                        ${isDark ? 'bg-zinc-700' : 'bg-zinc-300'}
-                        ${isSelected ? 'ring-4 ring-yellow-400 z-20' : ''}
-                        ${isValid ? 'hover:bg-green-400' : ''}
-                        ${shopActive && exists ? (canPlace ? 'hover:bg-blue-400/50' : 'hover:bg-red-400/50 cursor-not-allowed') : ''}
+                        relative cursor-pointer transition-all duration-200 flex items-center justify-center text-3xl md:text-5xl
+                        ${isDark ? 'bg-zinc-700/80' : 'bg-zinc-300'}
+                        ${isSelected ? 'bg-yellow-400 ring-4 ring-yellow-500/50 z-20' : ''}
+                        ${isValid ? 'hover:bg-green-400/80 bg-green-500/20' : ''}
+                        ${shopActive && exists ? (canPlace ? 'hover:bg-blue-400/50 bg-blue-500/10' : 'hover:bg-red-500/50 cursor-not-allowed') : ''}
                       `}
                     >
                       {ghost && (
@@ -286,20 +391,18 @@ export default function App() {
                           <span className={`${ghost.color === Color.WHITE ? 'text-white' : 'text-zinc-900'} scale-75`}>
                             {PIECE_ICONS[ghost.type][ghost.color]}
                           </span>
-                          <span className="absolute top-0 right-0 text-[10px] bg-blue-600 text-white px-1 rounded-full font-bold">
+                          <div className="absolute top-1 right-1 w-4 h-4 bg-blue-600 text-white text-[8px] flex items-center justify-center rounded-full font-black shadow-lg">
                             {ghost.materializeIn}
-                          </span>
+                          </div>
                         </div>
                       )}
                       {piece && (
-                        <span className={`${piece.color === Color.WHITE ? 'text-white' : 'text-zinc-900'} drop-shadow-md z-10`}>
+                        <span className={`${piece.color === Color.WHITE ? 'text-white drop-shadow-[0_2px_2px_rgba(0,0,0,0.5)]' : 'text-zinc-900'} z-10 select-none`}>
                           {PIECE_ICONS[piece.type][piece.color]}
                         </span>
                       )}
-                      {isValid && (
-                        <div className="absolute inset-0 flex items-center justify-center z-30">
-                          <div className={`w-3 h-3 md:w-4 md:h-4 rounded-full ${piece ? 'bg-red-500/60' : 'bg-zinc-900/20'}`} />
-                        </div>
+                      {isValid && !piece && (
+                        <div className="w-4 h-4 rounded-full bg-zinc-950/20" />
                       )}
                     </div>
                   );
@@ -310,81 +413,73 @@ export default function App() {
         </div>
 
         {gameOver && (
-          <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md">
-            <div className="bg-zinc-900 p-8 rounded-2xl border border-zinc-700 text-center shadow-2xl max-w-sm">
-              <h2 className="text-3xl font-black text-yellow-500 mb-6">{gameOver}</h2>
-              <button onClick={resetGame} className="w-full bg-yellow-500 text-black py-3 rounded-xl font-bold hover:bg-yellow-400 transition-colors">НОВАЯ ИГРА</button>
+          <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/90 backdrop-blur-xl text-center p-6">
+            <div className="bg-zinc-900 p-10 rounded-3xl border border-zinc-700 shadow-[0_0_50px_rgba(0,0,0,0.5)] max-w-sm w-full">
+              <h2 className="text-4xl font-black text-yellow-500 mb-2 italic">ФИНАЛ</h2>
+              <p className="text-zinc-400 mb-8 uppercase tracking-widest font-bold">{gameOver}</p>
+              <button onClick={() => window.location.reload()} className="w-full bg-white text-black py-4 rounded-2xl font-black hover:bg-zinc-200 transition-transform active:scale-95">НОВАЯ ИГРА</button>
             </div>
           </div>
         )}
       </div>
 
       <div className="w-full md:w-80 flex flex-col gap-4">
-        <div className="bg-zinc-900 p-4 rounded-xl border border-zinc-800 shadow-lg">
-          <div className="flex items-center justify-between mb-4">
-            <span className={`text-lg font-black tracking-tighter ${state.turn === Color.WHITE ? 'text-white' : 'text-zinc-400'}`}>
-              ХОД {state.turn === Color.WHITE ? 'БЕЛЫХ' : 'ЧЕРНЫХ'}
-            </span>
-          </div>
-          <div className="grid grid-cols-2 gap-2">
-            <div className="bg-zinc-800 p-2 rounded-lg border border-zinc-700">
-              <p className="text-[9px] text-zinc-500 font-bold uppercase mb-1">Золото Белых</p>
-              <p className="text-yellow-500 font-mono text-lg font-bold">🪙 {state.gold[Color.WHITE].toFixed(2)}</p>
-            </div>
-            <div className="bg-zinc-800 p-2 rounded-lg border border-zinc-700">
-              <p className="text-[9px] text-zinc-500 font-bold uppercase mb-1">Золото Черных</p>
-              <p className="text-yellow-500 font-mono text-lg font-bold">🪙 {state.gold[Color.BLACK].toFixed(2)}</p>
-            </div>
-          </div>
+        <div className="bg-zinc-900 p-5 rounded-2xl border border-zinc-800 shadow-xl">
+           <p className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest mb-2">Ваша роль</p>
+           <div className="flex items-center justify-between">
+             <p className={`text-2xl font-black ${myColor === Color.WHITE ? 'text-white' : 'text-zinc-500'}`}>
+               {myColor === Color.WHITE ? 'БЕЛЫЕ ⚪' : 'ЧЕРНЫЕ ⚫'}
+             </p>
+             <div className={`h-3 w-3 rounded-full ${connection?.open ? 'bg-green-500 shadow-[0_0_10px_rgba(34,197,94,0.5)]' : 'bg-red-500 animate-pulse'}`}></div>
+           </div>
+           <div className="mt-4 pt-4 border-t border-zinc-800/50">
+             <p className={`text-sm font-black uppercase tracking-tighter ${state.turn === myColor ? 'text-green-500' : 'text-zinc-600'}`}>
+               {state.turn === myColor ? '● Ваш ход' : '○ Ход противника'}
+             </p>
+           </div>
         </div>
 
-        <div className="bg-zinc-900 p-4 rounded-xl border border-zinc-800 shadow-lg">
-          <p className="text-zinc-500 text-[10px] font-bold uppercase tracking-widest mb-3">Арсенал (Магазин)</p>
-          <div className="grid grid-cols-2 gap-2">
+        <div className="bg-zinc-900 p-5 rounded-2xl border border-zinc-800 shadow-xl flex items-center justify-between">
+           <p className="text-[10px] text-zinc-500 font-bold uppercase tracking-widest">🪙 Золото</p>
+           <p className="text-yellow-500 font-mono text-3xl font-black tracking-tighter">{state.gold[myColor!].toFixed(1)}</p>
+        </div>
+
+        <div className="bg-zinc-900 p-5 rounded-2xl border border-zinc-800 shadow-xl">
+          <p className="text-zinc-500 text-[10px] font-bold uppercase tracking-widest mb-4">Магазин (3 хода на появление)</p>
+          <div className="grid grid-cols-5 md:grid-cols-2 gap-2">
             {[
-              { type: PieceType.PAWN, cost: 1, label: 'Пешка' },
-              { type: PieceType.KNIGHT, cost: 3, label: 'Конь' },
-              { type: PieceType.BISHOP, cost: 3, label: 'Слон' },
-              { type: PieceType.ROOK, cost: 5, label: 'Ладья' },
-              { type: PieceType.QUEEN, cost: 9, label: 'Ферзь' },
-            ].map(({ type, cost, label }) => (
+              { type: PieceType.PAWN, cost: 1 },
+              { type: PieceType.KNIGHT, cost: 3 },
+              { type: PieceType.BISHOP, cost: 3 },
+              { type: PieceType.ROOK, cost: 5 },
+              { type: PieceType.QUEEN, cost: 9 },
+            ].map(({ type, cost }) => (
               <button
                 key={type}
-                disabled={state.gold[state.turn] < cost || state.pieces.some(p => p.isGhost && p.color === state.turn)}
+                disabled={state.gold[myColor!] < cost || state.pieces.some(p => p.isGhost && p.color === myColor)}
                 onClick={() => setShopActive(type)}
                 className={`
-                  p-2 rounded-lg border transition-all flex flex-col items-center
-                  ${shopActive === type ? 'bg-blue-600 border-blue-400 shadow-[0_0_15px_rgba(37,99,235,0.4)]' : 'bg-zinc-800 border-zinc-700 hover:border-zinc-500'}
-                  disabled:opacity-25 disabled:cursor-not-allowed
+                  p-3 rounded-xl border transition-all flex flex-col items-center justify-center gap-1
+                  ${shopActive === type ? 'bg-blue-600 border-blue-400 shadow-[inset_0_2px_4px_rgba(0,0,0,0.3)]' : 'bg-zinc-800 border-zinc-700 hover:border-zinc-500'}
+                  disabled:opacity-20 disabled:grayscale
                 `}
               >
-                <span className="text-2xl">{PIECE_ICONS[type][state.turn]}</span>
-                <span className="text-[9px] font-bold uppercase mt-1">{label}</span>
-                <span className="text-xs text-yellow-500 font-mono font-bold">{cost}</span>
+                <span className="text-2xl md:text-3xl">{PIECE_ICONS[type][myColor!]}</span>
+                <span className="text-[10px] text-yellow-500 font-black">{cost}</span>
               </button>
             ))}
           </div>
-          {shopActive && (
-            <button onClick={() => setShopActive(null)} className="w-full mt-3 py-2 bg-red-900/30 text-red-400 rounded-lg text-[10px] uppercase font-bold border border-red-900/50 hover:bg-red-900/50">
-              Отменить покупку
-            </button>
-          )}
         </div>
 
-        <div className="flex-grow bg-zinc-900 p-4 rounded-xl border border-zinc-800 flex flex-col overflow-hidden shadow-lg">
-          <p className="text-zinc-500 text-[10px] font-bold uppercase tracking-widest mb-2">Хроника</p>
-          <div className="flex-grow overflow-y-auto space-y-1 font-mono text-[10px]">
+        <div className="flex-grow bg-zinc-900 p-4 rounded-2xl border border-zinc-800 flex flex-col overflow-hidden shadow-xl">
+          <div className="flex-grow overflow-y-auto space-y-1 pr-2 custom-scrollbar">
             {log.map((entry, i) => (
-              <div key={i} className={`p-2 rounded bg-zinc-800/40 border-l-2 ${entry.includes('Хаос') ? 'border-orange-500 text-orange-300' : 'border-zinc-600 text-zinc-400'}`}>
+              <div key={i} className="text-[10px] font-mono p-2 rounded-lg bg-zinc-950/50 text-zinc-500 border-l-2 border-zinc-700 leading-tight">
                 {entry}
               </div>
             ))}
           </div>
         </div>
-
-        <button onClick={resetGame} className="py-3 bg-zinc-800 hover:bg-red-900/20 hover:text-red-400 transition-all text-zinc-500 text-[10px] font-black rounded-xl uppercase border border-zinc-700">
-          Сдаться / Рестарт
-        </button>
       </div>
     </div>
   );
